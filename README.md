@@ -4,23 +4,55 @@
 
 ## 快速开始
 
-需要 Go 1.25 或更高版本。
+Linux x86-64 机器可直接一键安装：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/zhangga/udpfile/main/install.sh | sh
+```
+
+安装器会检查系统和 CPU 架构，下载静态编译产物及 `SHA256SUMS`，校验成功后安装到 `/usr/local/bin/udpfile`。普通用户在需要写入系统目录时会自动调用 `sudo`。
+
+确认安装：
+
+```bash
+udpfile help
+```
+
+如果没有 root 或 sudo 权限，可以安装到用户目录：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/zhangga/udpfile/main/install.sh \
+  | UDPFILE_INSTALL_DIR="$HOME/.local/bin" sh
+```
+
+确保 `$HOME/.local/bin` 已加入 `PATH`。内网镜像可设置 `UDPFILE_DOWNLOAD_BASE`。
+
+需要固定标签或提交时，安装器和产物应使用同一个 ref：
+
+```bash
+ref='<tag-or-commit>'
+curl -fsSL "https://raw.githubusercontent.com/zhangga/udpfile/$ref/install.sh" \
+  | UDPFILE_REF="$ref" sh
+```
+
+从源码编译需要 Go 1.25 或更高版本：
 
 ```bash
 go build -o bin/udpfile ./cmd/udpfile
 ```
 
-仓库中也包含已交叉编译的静态 Linux x86-64 版本：
+仓库中的预编译产物位于：
 
 ```text
 dist/linux-amd64/udpfile
 ```
 
-在 Linux 上校验后即可运行：
+手动下载时校验后即可运行：
 
 ```bash
 cd dist/linux-amd64
 sha256sum -c SHA256SUMS
+chmod +x udpfile
 ./udpfile help
 ```
 
@@ -29,7 +61,7 @@ sha256sum -c SHA256SUMS
 首次部署时，在目标服务器运行一次：
 
 ```bash
-./bin/udpfile keygen
+udpfile keygen
 ```
 
 该命令不会覆盖已有文件，并生成：
@@ -63,13 +95,13 @@ UDPFILE_RSA_PUBLIC_KEY=keys/server-public.pem
 
 ```bash
 # 目标服务器：只开放 UDP 9000
-./bin/udpfile server
+udpfile server
 ```
 
 在本地电脑启动 Web 助手：
 
 ```bash
-./bin/udpfile web
+udpfile web
 ```
 
 然后用本地浏览器打开：
@@ -94,10 +126,10 @@ tar -xzf 2026.tar.gz
 
 ```bash
 # 目标服务器
-./bin/udpfile server
+udpfile server
 
 # 本地客户端
-./bin/udpfile client \
+udpfile client \
   -path photos/2026 \
   -out ./received-photos
 ```
