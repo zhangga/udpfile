@@ -15,6 +15,7 @@ import (
 	"time"
 
 	archivefile "udpfile/internal/archive"
+	transferprogress "udpfile/internal/progress"
 	"udpfile/internal/protocol"
 	securetransport "udpfile/internal/secure"
 )
@@ -156,6 +157,8 @@ func downloadArchive(ctx context.Context, config Config, destination io.Writer) 
 	if config.Logger != nil {
 		config.Logger.Printf("receiving %d bytes in %d chunks", meta.Size, meta.Chunks)
 	}
+	progressReporter := transferprogress.New(config.Logger, "接收", meta.Size, meta.Chunks)
+	progressReporter.Report(0, 0)
 
 	hash := sha256.New()
 	writer := io.MultiWriter(destination, hash)
@@ -176,6 +179,7 @@ func downloadArchive(ctx context.Context, config Config, destination io.Writer) 
 			return ArchiveInfo{}, fmt.Errorf("write downloaded chunk: %w", err)
 		}
 		received += uint64(len(data))
+		progressReporter.Report(received, index+1)
 	}
 	if received != meta.Size {
 		return ArchiveInfo{}, fmt.Errorf("received %d bytes, want %d", received, meta.Size)

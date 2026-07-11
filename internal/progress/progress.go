@@ -1,0 +1,95 @@
+package progress
+
+import (
+	"fmt"
+	"log"
+	"sync"
+	"time"
+)
+
+const (
+	maximumQuietInterval = 2 * time.Second
+	percentageStep       = 5
+)
+
+type Reporter struct {
+	mu              sync.Mutex
+	logger          *log.Logger
+	label           string
+	totalBytes      uint64
+	totalChunks     uint32
+	completedBytes  uint64
+	completedChunks uint32
+	lastBucket      int
+	lastReport      time.Time
+}
+
+func New(logger *log.Logger, label string, totalBytes uint64, totalChunks uint32) *Reporter {
+	return &Reporter{
+		logger:      logger,
+		label:       label,
+		totalBytes:  totalBytes,
+		totalChunks: totalChunks,
+		lastBucket:  -1,
+	}
+}
+
+func (reporter *Reporter) Report(completedBytes uint64, completedChunks uint32) {
+	if reporter == nil || reporter.logger == nil {
+		return
+	}
+	reporter.mu.Lock()
+	defer reporter.mu.Unlock()
+	if completedBytes > reporter.completedBytes {
+		reporter.completedBytes = completedBytes
+	}
+	if completedChunks > reporter.completedChunks {
+		reporter.completedChunks = completedChunks
+	}
+	if reporter.completedBytes > reporter.totalBytes {
+		reporter.completedBytes = reporter.totalBytes
+	}
+	if reporter.completedChunks > reporter.totalChunks {
+		reporter.completedChunks = reporter.totalChunks
+	}
+	percent := 100
+	if reporter.totalBytes > 0 {
+		percent = int(reporter.completedBytes * 100 / reporter.totalBytes)
+	}
+	now := time.Now()
+	completed := reporter.completedBytes == reporter.totalBytes && reporter.completedChunks == reporter.totalChunks
+	bucket := percent / percentageStep
+	if bucket == reporter.lastBucket {
+		if completed || now.Sub(reporter.lastReport) < maximumQuietInterval {
+			return
+		}
+	}
+	reporter.lastBucket = bucket
+	reporter.lastReport = now
+	reporter.logger.Printf("%s进度 %d%%（%s / %s，%d / %d 分片）",
+		reporter.label,
+		percent,
+		formatBytes(reporter.completedBytes),
+		formatBytes(reporter.totalBytes),
+		reporter.completedChunks,
+		reporter.totalChunks,
+	)
+}
+
+func formatBytes(value uint64) string {
+	const (
+		kib = uint64(1 << 10)
+		mib = uint64(1 << 20)
+		gib = uint64(1 << 30)
+	)
+	switch {
+	case value >= gib:
+		return fmt.Sprintf("%.2f GiB", float64(value)/float64(gib))
+	case value >= mib:
+		return fmt.Sprintf("%.2f MiB", float64(value)/float64(mib))
+	case value >= kib:
+		return fmt.Sprintf("%.2f KiB", float64(value)/float64(kib))
+	default:
+		return fmt.Sprintf("%d B", value)
+	}
+}

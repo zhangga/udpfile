@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -46,7 +47,8 @@ func TestClientPairsOnceThenUsesCachedCredentials(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	serverAddress, stopServer := startPairingTestServer(t, root, secret, identity)
+	var serverLog synchronizedBuffer
+	serverAddress, stopServer := startPairingTestServer(t, root, secret, identity, &serverLog)
 	defer stopServer()
 	pairingFile := filepath.Join(configurationDirectory, "pairing-token")
 	if err := os.WriteFile(pairingFile, []byte(token+"\n"), 0o600); err != nil {
@@ -58,10 +60,17 @@ func TestClientPairsOnceThenUsesCachedCredentials(t *testing.T) {
 		"download", "-server", serverAddress, "-path", "shared",
 		"-pair-file", pairingFile, "-retry", "20ms", "-timeout", "5s",
 	}
-	if err := Run(arguments, io.Discard, io.Discard); err != nil {
+	var clientLog bytes.Buffer
+	if err := Run(arguments, &clientLog, &clientLog); err != nil {
 		t.Fatalf("first paired client Run() error = %v", err)
 	}
 	assertPairingTestFile(t, filepath.Join(firstDestination, "hello.txt"), want)
+	if !strings.Contains(clientLog.String(), "接收进度 100%") {
+		t.Fatalf("client log does not show completed progress: %s", clientLog.String())
+	}
+	if !strings.Contains(serverLog.String(), "发送进度 100%") {
+		t.Fatalf("server log does not show completed progress: %s", serverLog.String())
+	}
 
 	if err := os.RemoveAll(firstDestination); err != nil {
 		t.Fatal(err)
@@ -75,6 +84,23 @@ func TestClientPairsOnceThenUsesCachedCredentials(t *testing.T) {
 		t.Fatalf("second cached client Run() error = %v", err)
 	}
 	assertPairingTestFile(t, filepath.Join(secondDestination, "hello.txt"), want)
+}
+
+type synchronizedBuffer struct {
+	mu     sync.Mutex
+	buffer bytes.Buffer
+}
+
+func (buffer *synchronizedBuffer) Write(data []byte) (int, error) {
+	buffer.mu.Lock()
+	defer buffer.mu.Unlock()
+	return buffer.buffer.Write(data)
+}
+
+func (buffer *synchronizedBuffer) String() string {
+	buffer.mu.Lock()
+	defer buffer.mu.Unlock()
+	return buffer.buffer.String()
 }
 
 func TestClientRejectsWorldReadablePairingFile(t *testing.T) {
@@ -102,7 +128,7 @@ func TestClientRejectsWorldReadablePairingFile(t *testing.T) {
 	}
 }
 
-func startPairingTestServer(t *testing.T, root string, secret []byte, identity *rsa.PrivateKey) (string, func()) {
+func startPairingTestServer(t *testing.T, root string, secret []byte, identity *rsa.PrivateKey, logOutput io.Writer) (string, func()) {
 	t.Helper()
 	connection, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
 	if err != nil {
@@ -112,7 +138,7 @@ func startPairingTestServer(t *testing.T, root string, secret []byte, identity *
 		Root:           root,
 		SharedSecret:   secret,
 		ServerIdentity: identity,
-		Logger:         log.New(io.Discard, "", 0),
+		Logger:         log.New(logOutput, "", 0),
 	})
 	if err != nil {
 		connection.Close()

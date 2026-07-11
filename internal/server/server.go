@@ -16,6 +16,7 @@ import (
 	"time"
 
 	archivefile "udpfile/internal/archive"
+	transferprogress "udpfile/internal/progress"
 	"udpfile/internal/protocol"
 	securetransport "udpfile/internal/secure"
 )
@@ -57,6 +58,9 @@ type session struct {
 	file          *os.File
 	filePath      string
 	meta          protocol.Meta
+	progress      *transferprogress.Reporter
+	sentBytes     uint64
+	sentChunks    uint32
 }
 
 func New(connection *net.UDPConn, config Config) (*Server, error) {
@@ -302,6 +306,7 @@ func (server *Server) prepare(id protocol.RequestID, current *session, clientAdd
 	}
 	meta := protocol.Meta{Size: uint64(archiveInfo.Size), Chunks: uint32(chunks), ChunkSize: protocol.ChunkSize}
 	meta.SHA256 = archiveInfo.SHA256
+	progressReporter := transferprogress.New(server.config.Logger, "发送", meta.Size, meta.Chunks)
 
 	server.mu.Lock()
 	if server.sessions[id] != current {
@@ -314,10 +319,12 @@ func (server *Server) prepare(id protocol.RequestID, current *session, clientAdd
 	current.file = input
 	current.filePath = archivePath
 	current.meta = meta
+	current.progress = progressReporter
 	current.lastAccess = time.Now()
 	server.mu.Unlock()
 
 	server.config.Logger.Printf("ready %q: %d bytes in %d chunks", current.requestedPath, meta.Size, meta.Chunks)
+	progressReporter.Report(0, 0)
 	server.sendMeta(current, id, meta, clientAddress)
 }
 
@@ -338,7 +345,9 @@ func (server *Server) handleGet(packet []byte, clientAddress *net.UDPAddr) {
 	}
 	server.mu.Lock()
 	current, ok := server.sessions[id]
-	if !ok || current.preparing || index >= current.meta.Chunks {
+	// New chunks must be requested in order so progress reflects unique data.
+	// Requests for earlier chunks remain valid retransmissions.
+	if !ok || current.preparing || index >= current.meta.Chunks || index > current.sentChunks {
 		server.mu.Unlock()
 		return
 	}
@@ -359,7 +368,26 @@ func (server *Server) handleGet(packet []byte, clientAddress *net.UDPAddr) {
 	if err != nil {
 		return
 	}
-	server.sendEncrypted(current, response, clientAddress)
+	if !server.sendEncrypted(current, response, clientAddress) {
+		return
+	}
+	var (
+		reporter   *transferprogress.Reporter
+		sentBytes  uint64
+		sentChunks uint32
+	)
+	server.mu.Lock()
+	if server.sessions[id] == current && index == current.sentChunks {
+		current.sentChunks++
+		current.sentBytes += uint64(len(data))
+		reporter = current.progress
+		sentBytes = current.sentBytes
+		sentChunks = current.sentChunks
+	}
+	server.mu.Unlock()
+	if reporter != nil {
+		reporter.Report(sentBytes, sentChunks)
+	}
 }
 
 func (server *Server) handleDone(packet []byte, clientAddress *net.UDPAddr) {
@@ -393,19 +421,23 @@ func (server *Server) sendError(current *session, id protocol.RequestID, address
 	}
 }
 
-func (server *Server) sendEncrypted(current *session, innerPacket []byte, address *net.UDPAddr) {
+func (server *Server) sendEncrypted(current *session, innerPacket []byte, address *net.UDPAddr) bool {
 	packet, err := current.security.Seal(innerPacket)
 	if err != nil {
 		server.config.Logger.Printf("encrypt packet for %s: %v", address, err)
-		return
+		return false
 	}
-	server.send(packet, address)
+	return server.send(packet, address)
 }
 
-func (server *Server) send(packet []byte, address *net.UDPAddr) {
-	if _, err := server.connection.WriteToUDP(packet, address); err != nil && !errors.Is(err, net.ErrClosed) {
-		server.config.Logger.Printf("send packet to %s: %v", address, err)
+func (server *Server) send(packet []byte, address *net.UDPAddr) bool {
+	if _, err := server.connection.WriteToUDP(packet, address); err != nil {
+		if !errors.Is(err, net.ErrClosed) {
+			server.config.Logger.Printf("send packet to %s: %v", address, err)
+		}
+		return false
 	}
+	return true
 }
 
 func (server *Server) cleanupExpired() {
