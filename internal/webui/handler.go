@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"udpfile/internal/client"
+	"udpfile/internal/pairing"
 )
 
 //go:embed index.html
@@ -43,22 +44,29 @@ type Config struct {
 	MaxConcurrent   int
 	SharedSecret    []byte
 	ServerIdentity  *rsa.PublicKey
+	CredentialStore CredentialStore
 	Logger          *log.Logger
 }
 
+type CredentialStore interface {
+	Load(serverAddress string) ([]byte, *rsa.PublicKey, bool, error)
+	Save(serverAddress string, sharedSecret []byte, serverIdentity *rsa.PublicKey) error
+}
+
 type Handler struct {
-	page           *template.Template
-	csrfToken      string
-	defaultServer  string
-	defaultPort    int
-	tempDir        string
-	timeout        time.Duration
-	retryInterval  time.Duration
-	maxArchive     uint64
-	sharedSecret   []byte
-	serverIdentity *rsa.PublicKey
-	downloadSlots  chan struct{}
-	logger         *log.Logger
+	page            *template.Template
+	csrfToken       string
+	defaultServer   string
+	defaultPort     int
+	tempDir         string
+	timeout         time.Duration
+	retryInterval   time.Duration
+	maxArchive      uint64
+	sharedSecret    []byte
+	serverIdentity  *rsa.PublicKey
+	credentialStore CredentialStore
+	downloadSlots   chan struct{}
+	logger          *log.Logger
 }
 
 type pageData struct {
@@ -74,11 +82,16 @@ func NewHandler(config Config) (http.Handler, error) {
 	if config.DefaultPort < 1 || config.DefaultPort > 65535 {
 		return nil, errors.New("default UDP port must be between 1 and 65535")
 	}
-	if len(config.SharedSecret) != 32 {
-		return nil, errors.New("32-byte shared secret is required")
-	}
-	if config.ServerIdentity == nil || config.ServerIdentity.N.BitLen() < 2048 {
-		return nil, errors.New("RSA server identity of at least 2048 bits is required")
+	hasFixedCredentials := len(config.SharedSecret) != 0 || config.ServerIdentity != nil
+	if hasFixedCredentials {
+		if len(config.SharedSecret) != 32 {
+			return nil, errors.New("32-byte shared secret is required")
+		}
+		if config.ServerIdentity == nil || config.ServerIdentity.N.BitLen() < 2048 {
+			return nil, errors.New("RSA server identity of at least 2048 bits is required")
+		}
+	} else if config.CredentialStore == nil {
+		return nil, errors.New("fixed credentials or a credential store is required")
 	}
 	if config.Logger == nil {
 		config.Logger = log.New(io.Discard, "", 0)
@@ -110,18 +123,19 @@ func NewHandler(config Config) (http.Handler, error) {
 		return nil, err
 	}
 	return &Handler{
-		page:           page,
-		csrfToken:      base64.RawURLEncoding.EncodeToString(tokenBytes),
-		defaultServer:  config.DefaultServer,
-		defaultPort:    config.DefaultPort,
-		tempDir:        config.TempDir,
-		timeout:        config.TransferTimeout,
-		retryInterval:  config.RetryInterval,
-		maxArchive:     config.MaxArchiveSize,
-		sharedSecret:   append([]byte(nil), config.SharedSecret...),
-		serverIdentity: config.ServerIdentity,
-		downloadSlots:  make(chan struct{}, config.MaxConcurrent),
-		logger:         config.Logger,
+		page:            page,
+		csrfToken:       base64.RawURLEncoding.EncodeToString(tokenBytes),
+		defaultServer:   config.DefaultServer,
+		defaultPort:     config.DefaultPort,
+		tempDir:         config.TempDir,
+		timeout:         config.TransferTimeout,
+		retryInterval:   config.RetryInterval,
+		maxArchive:      config.MaxArchiveSize,
+		sharedSecret:    append([]byte(nil), config.SharedSecret...),
+		serverIdentity:  config.ServerIdentity,
+		credentialStore: config.CredentialStore,
+		downloadSlots:   make(chan struct{}, config.MaxConcurrent),
+		logger:          config.Logger,
 	}, nil
 }
 
@@ -195,14 +209,49 @@ func (handler *Handler) serveDownload(response http.ResponseWriter, request *htt
 	}()
 
 	serverAddress := net.JoinHostPort(serverIP.String(), strconv.Itoa(port))
+	sharedSecret := handler.sharedSecret
+	serverIdentity := handler.serverIdentity
+	shouldCacheCredentials := false
+	if handler.credentialStore != nil {
+		var found bool
+		sharedSecret, serverIdentity, found, err = handler.credentialStore.Load(serverAddress)
+		if err != nil {
+			handler.logger.Printf("load cached credentials for %s: %v", serverAddress, err)
+			http.Error(response, "无法读取本地配对凭据", http.StatusInternalServerError)
+			return
+		}
+		providedPairingToken := strings.TrimSpace(request.FormValue("pair"))
+		if !found {
+			if providedPairingToken == "" {
+				http.Error(response, "首次连接该服务器请输入配对令牌", http.StatusBadRequest)
+				return
+			}
+			sharedSecret, serverIdentity, err = pairing.Decode(providedPairingToken)
+			if err != nil {
+				http.Error(response, "配对令牌无效："+err.Error(), http.StatusBadRequest)
+				return
+			}
+			shouldCacheCredentials = true
+		} else if providedPairingToken != "" {
+			pairedSecret, pairedIdentity, decodeErr := pairing.Decode(providedPairingToken)
+			if decodeErr != nil {
+				http.Error(response, "配对令牌无效："+decodeErr.Error(), http.StatusBadRequest)
+				return
+			}
+			if saveErr := handler.credentialStore.Save(serverAddress, pairedSecret, pairedIdentity); saveErr != nil {
+				http.Error(response, "配对身份与本地缓存不一致："+saveErr.Error(), http.StatusConflict)
+				return
+			}
+		}
+	}
 	ctx, cancel := context.WithTimeout(request.Context(), handler.timeout)
 	info, downloadErr := client.DownloadArchive(ctx, client.Config{
 		ServerAddress:  serverAddress,
 		RequestedPath:  requestedPath,
 		RetryInterval:  handler.retryInterval,
 		MaxArchiveSize: handler.maxArchive,
-		SharedSecret:   handler.sharedSecret,
-		ServerIdentity: handler.serverIdentity,
+		SharedSecret:   sharedSecret,
+		ServerIdentity: serverIdentity,
 		Logger:         handler.logger,
 	}, temporary)
 	cancel()
@@ -214,6 +263,13 @@ func (handler *Handler) serveDownload(response http.ResponseWriter, request *htt
 		handler.logger.Printf("UDP download from %s path %q: %v", serverAddress, requestedPath, downloadErr)
 		http.Error(response, "UDP 下载失败："+downloadErr.Error(), status)
 		return
+	}
+	if shouldCacheCredentials {
+		if err := handler.credentialStore.Save(serverAddress, sharedSecret, serverIdentity); err != nil {
+			handler.logger.Printf("save paired credentials for %s: %v", serverAddress, err)
+			http.Error(response, "下载成功但无法安全保存配对凭据", http.StatusInternalServerError)
+			return
+		}
 	}
 	if err := temporary.Sync(); err != nil {
 		http.Error(response, "无法同步本地临时文件", http.StatusInternalServerError)

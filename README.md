@@ -56,23 +56,55 @@ chmod +x udpfile
 ./udpfile help
 ```
 
-## 生成安全配置
+## 零配置启动与首次配对
 
-首次部署时，在目标服务器运行一次：
+服务端不再要求预先创建 `.env` 或密钥。直接指定监听地址和共享目录：
+
+```bash
+udpfile server -addr 0.0.0.0:9000 -root /srv/share
+```
+
+首次启动会自动生成随机共享密钥和 RSA 身份，默认保存在当前运行用户的配置目录：
+
+```text
+~/.config/udpfile/server/credentials.json
+~/.config/udpfile/server/keys/server-private.pem
+~/.config/udpfile/server/keys/server-public.pem
+```
+
+服务器只在首次生成凭据时打印以 `UDF2-` 开头的配对令牌。客户端第一次连接时粘贴一次：
+
+```bash
+udpfile client \
+  -server 192.168.1.20:9000 \
+  -path photos/2026 \
+  -out ./received-photos
+```
+
+客户端会通过终端无回显地提示粘贴令牌，令牌不会出现在命令历史或 `ps` 中。传输成功后，客户端会按服务器 `IP:端口` 把凭据保存到 `~/.config/udpfile/clients/`。后续下载无需再次提供令牌：
+
+```bash
+udpfile client \
+  -server 192.168.1.20:9000 \
+  -path photos/2026 \
+  -out ./received-again
+```
+
+配对令牌包含访问密钥和服务器公钥，等同于访问密码：虽然每台客户端只需输入一次，但令牌本身在服务器换钥前持续有效，不得发到公开聊天或日志。若首次输出没有保存，可运行 `udpfile server -show-pairing-token` 再次显示。
+
+自动化环境可以设置 `UDPFILE_PAIRING_TOKEN`，或通过 `-pair-file /path/to/token` 从权限为 `0600` 的文件读取；`-pair-file -` 表示从标准输入读取。不要把令牌直接写进命令行参数。
+
+配置根目录可通过 `UDPFILE_CONFIG_DIR` 修改。服务端应始终使用同一个系统用户启动；用 `sudo` 启动时凭据会保存在 root 用户的配置目录。
+
+## 可选的显式 `.env` 配置
+
+需要集中管理密钥或兼容旧部署时，仍可手动生成：
 
 ```bash
 udpfile keygen
 ```
 
-该命令不会覆盖已有文件，并生成：
-
-```text
-.env                         # 端口、目录、共享密钥和密钥路径（权限 0600）
-keys/server-private.pem      # 3072 位 RSA 私钥（权限 0600）
-keys/server-public.pem       # RSA 公钥
-```
-
-编辑 `.env` 中的共享目录和目标 IP：
+编辑生成的 `.env`：
 
 ```dotenv
 UDPFILE_SERVER_ADDR=0.0.0.0:9000
@@ -85,7 +117,7 @@ UDPFILE_RSA_PRIVATE_KEY=keys/server-private.pem
 UDPFILE_RSA_PUBLIC_KEY=keys/server-public.pem
 ```
 
-服务器保留 `.env` 和 RSA 私钥。客户端需要安全复制同一份共享密钥和 `server-public.pem`，但绝不能复制服务器私钥。三个运行命令都会自动加载当前目录的 `.env`；也可以通过 `UDPFILE_ENV=/path/to/config.env` 指定其他配置文件。
+显式环境密钥优先于自动凭据。服务器保留 `.env` 和 RSA 私钥；客户端只复制共享密钥和 `server-public.pem`，绝不能复制服务器私钥。三个运行命令都会自动加载当前目录的 `.env`；也可以通过 `UDPFILE_ENV=/path/to/config.env` 指定其他配置文件。
 
 真实 `.env` 和 `keys/` 已被 `.gitignore` 排除；仓库中的 `.env.example` 不包含可用秘密。
 
@@ -95,7 +127,7 @@ UDPFILE_RSA_PUBLIC_KEY=keys/server-public.pem
 
 ```bash
 # 目标服务器：只开放 UDP 9000
-udpfile server
+udpfile server -addr 0.0.0.0:9000 -root /srv/share
 ```
 
 在本地电脑启动 Web 助手：
@@ -110,7 +142,7 @@ udpfile web
 http://127.0.0.1:8080
 ```
 
-在页面中输入目标服务器 IP、UDP 端口和目录，例如 `photos/2026`，点击“下载目录”。浏览器最终下载 `2026.tar.gz`；跨电脑的请求、分片、重传和文件内容全部走 UDP，本地 HTTP 仅存在于浏览器与 `127.0.0.1` 上的助手之间。
+在页面中输入目标服务器 IP、UDP 端口和目录。首次连接还需粘贴服务端显示的配对令牌；成功后本机会自动保存，后续留空即可。浏览器最终下载 `2026.tar.gz`；跨电脑的请求、分片、重传和文件内容全部走 UDP，本地 HTTP 仅存在于浏览器与 `127.0.0.1` 上的助手之间。
 
 解压下载结果：
 
@@ -126,10 +158,11 @@ tar -xzf 2026.tar.gz
 
 ```bash
 # 目标服务器
-udpfile server
+udpfile server -addr 0.0.0.0:9000 -root /srv/share
 
-# 本地客户端
+# 本地客户端首次连接
 udpfile client \
+  -server 192.168.1.20:9000 \
   -path photos/2026 \
   -out ./received-photos
 ```
@@ -172,6 +205,7 @@ udpfile server:
   -max-sessions  最大并发会话数
   -session-ttl   临时归档保留时间
   -temp-dir      临时归档目录
+  -show-pairing-token 重新显示自动凭据的配对令牌
 
 udpfile client:
   -server        服务器地址，默认 127.0.0.1:9000
@@ -180,6 +214,7 @@ udpfile client:
   -timeout       整体传输超时，默认 10m
   -retry         单包重试间隔，默认 300ms
   -max-archive   接受的最大压缩包大小
+  -pair-file     从权限为 0600 的文件或标准输入读取首次配对令牌
 
 udpfile web:
   -listen        本地页面地址，默认 127.0.0.1:8080，只允许回环地址

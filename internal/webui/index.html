@@ -255,9 +255,13 @@
             <span>远端目录（相对于服务端共享根目录）</span>
             <input name="path" type="text" placeholder="documents/2026" maxlength="1024" autocomplete="off" required>
           </label>
+          <label>
+            <span>首次配对令牌（已配对可留空）</span>
+            <input name="pair" type="password" placeholder="UDF2-..." autocomplete="off">
+          </label>
           <button type="submit">下载目录 ↘</button>
         </form>
-        <p class="note"><strong>注意：</strong>下载会在新窗口启动；服务器返回的是经过校验的 tar.gz 归档。本地 HTTP 仅绑定 127.0.0.1，不会暴露给局域网。</p>
+        <p class="note"><strong>注意：</strong>首次连接需粘贴服务器显示的配对令牌，成功后本机会安全保存。下载会在新窗口启动；本地 HTTP 仅绑定 127.0.0.1，不会暴露给局域网。</p>
       </section>
     </main>
   </div>

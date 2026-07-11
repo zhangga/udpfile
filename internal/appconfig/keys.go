@@ -91,6 +91,11 @@ func GenerateKeyMaterial(directory string, rsaBits int) (KeyMaterial, error) {
 		_ = os.Remove(privatePath)
 		return KeyMaterial{}, err
 	}
+	if err := syncDirectory(directory); err != nil {
+		_ = os.Remove(privatePath)
+		_ = os.Remove(publicPath)
+		return KeyMaterial{}, fmt.Errorf("sync key directory: %w", err)
+	}
 
 	secret := make([]byte, 32)
 	if _, err := rand.Read(secret); err != nil {
@@ -168,6 +173,11 @@ func writeExclusivePEM(path string, mode os.FileMode, blockType string, der []by
 		_ = output.Close()
 		_ = os.Remove(path)
 		return fmt.Errorf("write %s: %w", path, err)
+	}
+	if err := output.Sync(); err != nil {
+		_ = output.Close()
+		_ = os.Remove(path)
+		return fmt.Errorf("sync %s: %w", path, err)
 	}
 	if err := output.Close(); err != nil {
 		_ = os.Remove(path)

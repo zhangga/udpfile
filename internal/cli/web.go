@@ -38,16 +38,12 @@ func runWeb(arguments []string, output, diagnostics io.Writer) error {
 	if err := flags.Parse(arguments); err != nil {
 		return err
 	}
-	sharedSecret, serverIdentity, err := appconfig.LoadClientCredentials()
-	if err != nil {
-		return err
-	}
 	resolvedListenAddress, err := resolveLoopbackListenAddress(*listenAddress)
 	if err != nil {
 		return err
 	}
 	logger := log.New(output, "udpfile web: ", log.LstdFlags)
-	handler, err := webui.NewHandler(webui.Config{
+	handlerConfig := webui.Config{
 		DefaultServer:   *defaultServer,
 		DefaultPort:     *defaultPort,
 		TempDir:         *tempDir,
@@ -55,10 +51,23 @@ func runWeb(arguments []string, output, diagnostics io.Writer) error {
 		RetryInterval:   *retryInterval,
 		MaxArchiveSize:  *maxArchive,
 		MaxConcurrent:   *maxDownloads,
-		SharedSecret:    sharedSecret,
-		ServerIdentity:  serverIdentity,
 		Logger:          logger,
-	})
+	}
+	if os.Getenv("UDPFILE_SHARED_SECRET") != "" || os.Getenv("UDPFILE_RSA_PUBLIC_KEY") != "" {
+		sharedSecret, serverIdentity, credentialErr := appconfig.LoadClientCredentials()
+		if credentialErr != nil {
+			return credentialErr
+		}
+		handlerConfig.SharedSecret = sharedSecret
+		handlerConfig.ServerIdentity = serverIdentity
+	} else {
+		credentialStore, credentialErr := appconfig.NewDefaultClientCredentialStore()
+		if credentialErr != nil {
+			return credentialErr
+		}
+		handlerConfig.CredentialStore = credentialStore
+	}
+	handler, err := webui.NewHandler(handlerConfig)
 	if err != nil {
 		return err
 	}

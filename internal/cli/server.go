@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"crypto/rsa"
 	"fmt"
 	"io"
 	"log"
@@ -26,10 +27,11 @@ func runServer(arguments []string, output, diagnostics io.Writer) error {
 	maxSessions := flags.Int("max-sessions", 32, "最大并发传输会话数")
 	sessionTTL := flags.Duration("session-ttl", 5*time.Minute, "会话失效及临时归档清理时间")
 	tempDir := flags.String("temp-dir", "", "临时归档目录（默认使用系统临时目录）")
+	showPairingToken := flags.Bool("show-pairing-token", false, "显示自动生成凭据的配对令牌")
 	if err := flags.Parse(arguments); err != nil {
 		return err
 	}
-	sharedSecret, serverIdentity, err := appconfig.LoadServerCredentials()
+	sharedSecret, serverIdentity, err := resolveServerCredentials(output, *showPairingToken)
 	if err != nil {
 		return err
 	}
@@ -61,4 +63,23 @@ func runServer(arguments []string, output, diagnostics io.Writer) error {
 	defer stop()
 	logger.Printf("监听 %s，共享根目录 %s", connection.LocalAddr(), *root)
 	return instance.Serve(ctx)
+}
+
+func resolveServerCredentials(output io.Writer, showPairingToken bool) ([]byte, *rsa.PrivateKey, error) {
+	if os.Getenv("UDPFILE_SHARED_SECRET") != "" || os.Getenv("UDPFILE_RSA_PRIVATE_KEY") != "" {
+		return appconfig.LoadServerCredentials()
+	}
+	credentials, err := appconfig.LoadOrCreateDefaultServerCredentials()
+	if err != nil {
+		return nil, nil, err
+	}
+	if credentials.Created {
+		fmt.Fprintf(output, "已自动生成服务器安全凭据：%s\n", credentials.Directory)
+		fmt.Fprintln(output, "首次连接请把下面的配对令牌复制到客户端；它等同于访问密码，请勿公开：")
+		fmt.Fprintln(output, credentials.PairingToken)
+	} else if showPairingToken {
+		fmt.Fprintln(output, "配对令牌（等同于访问密码，请勿公开）：")
+		fmt.Fprintln(output, credentials.PairingToken)
+	}
+	return credentials.SharedSecret, credentials.Identity, nil
 }

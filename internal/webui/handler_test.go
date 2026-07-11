@@ -21,6 +21,7 @@ import (
 	"time"
 
 	archivefile "udpfile/internal/archive"
+	"udpfile/internal/pairing"
 	"udpfile/internal/server"
 	"udpfile/internal/webui"
 )
@@ -45,7 +46,7 @@ func TestHomePageCollectsUDPServerAndDirectory(t *testing.T) {
 	body := response.Body.String()
 	for _, expected := range []string{
 		`<form`, `action="/download"`, `method="post"`,
-		`name="server"`, `name="port"`, `name="path"`, `name="csrf_token"`,
+		`name="server"`, `name="port"`, `name="path"`, `name="pair"`, `name="csrf_token"`,
 		`UDP 文件接收站`, `下载目录`,
 	} {
 		if !strings.Contains(body, expected) {
@@ -54,6 +55,50 @@ func TestHomePageCollectsUDPServerAndDirectory(t *testing.T) {
 	}
 	if got := response.Header().Get("Content-Security-Policy"); got == "" {
 		t.Error("GET / did not set Content-Security-Policy")
+	}
+}
+
+func TestDownloadPairsThenUsesCachedCredentials(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "documents")
+	mustMkdirAll(t, source)
+	mustWriteFile(t, filepath.Join(source, "paired.txt"), []byte("paired through web\n"))
+	udpAddress, stopServer := startUDPServer(t, root)
+	defer stopServer()
+	store := &memoryCredentialStore{}
+	handler, err := webui.NewHandler(webui.Config{
+		DefaultPort:     udpAddress.Port,
+		CredentialStore: store,
+		Logger:          log.New(io.Discard, "", 0),
+	})
+	if err != nil {
+		t.Fatalf("NewHandler() error = %v", err)
+	}
+	pairingToken, err := pairing.Encode(webTestSecret, &webRSAIdentity(t).PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for attempt := 0; attempt < 2; attempt++ {
+		form := url.Values{
+			"csrf_token": {readCSRFToken(t, handler)},
+			"server":     {"127.0.0.1"},
+			"port":       {strconv.Itoa(udpAddress.Port)},
+			"path":       {"documents"},
+		}
+		if attempt == 0 {
+			form.Set("pair", pairingToken)
+		}
+		request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/download", strings.NewReader(form.Encode()))
+		request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusOK {
+			t.Fatalf("attempt %d status = %d, want %d; body=%s", attempt+1, response.Code, http.StatusOK, response.Body.String())
+		}
+	}
+	if store.saves != 1 {
+		t.Fatalf("credential saves = %d, want 1", store.saves)
 	}
 }
 
@@ -216,6 +261,28 @@ func webRSAIdentity(t *testing.T) *rsa.PrivateKey {
 		t.Fatalf("generate test RSA identity: %v", webTestIdentityErr)
 	}
 	return webTestIdentity
+}
+
+type memoryCredentialStore struct {
+	serverAddress string
+	sharedSecret  []byte
+	identity      *rsa.PublicKey
+	saves         int
+}
+
+func (store *memoryCredentialStore) Load(serverAddress string) ([]byte, *rsa.PublicKey, bool, error) {
+	if store.serverAddress != serverAddress || store.identity == nil {
+		return nil, nil, false, nil
+	}
+	return append([]byte(nil), store.sharedSecret...), store.identity, true, nil
+}
+
+func (store *memoryCredentialStore) Save(serverAddress string, sharedSecret []byte, identity *rsa.PublicKey) error {
+	store.serverAddress = serverAddress
+	store.sharedSecret = append([]byte(nil), sharedSecret...)
+	store.identity = identity
+	store.saves++
+	return nil
 }
 
 func mustMkdirAll(t *testing.T, path string) {
