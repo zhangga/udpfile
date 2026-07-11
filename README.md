@@ -44,7 +44,8 @@ go build -o bin/udpfile ./cmd/udpfile
 仓库中的预编译产物位于：
 
 ```text
-dist/linux-amd64/udpfile
+dist/linux-amd64/udpfile    # Linux x86-64
+dist/darwin-arm64/udpfile   # macOS Apple Silicon
 ```
 
 手动下载时校验后即可运行：
@@ -52,6 +53,15 @@ dist/linux-amd64/udpfile
 ```bash
 cd dist/linux-amd64
 sha256sum -c SHA256SUMS
+chmod +x udpfile
+./udpfile help
+```
+
+macOS Apple Silicon 手动校验：
+
+```bash
+cd dist/darwin-arm64
+shasum -a 256 -c SHA256SUMS
 chmod +x udpfile
 ./udpfile help
 ```
@@ -64,12 +74,15 @@ chmod +x udpfile
 udpfile server -addr 0.0.0.0:9000 -root /srv/share
 ```
 
-首次启动会自动生成随机共享密钥和 RSA 身份，默认保存在当前运行用户的配置目录：
+首次启动会自动生成随机共享密钥和 RSA 身份，默认保存在当前运行用户的系统配置目录：
 
 ```text
-~/.config/udpfile/server/credentials.json
-~/.config/udpfile/server/keys/server-private.pem
-~/.config/udpfile/server/keys/server-public.pem
+Linux:  ~/.config/udpfile
+macOS:  ~/Library/Application Support/udpfile
+
+server/credentials.json
+server/keys/server-private.pem
+server/keys/server-public.pem
 ```
 
 服务器只在首次生成凭据时打印以 `UDF2-` 开头的配对令牌。客户端第一次连接时粘贴一次：
@@ -81,7 +94,7 @@ udpfile client \
   -out ./received-photos
 ```
 
-客户端会通过终端无回显地提示粘贴令牌，令牌不会出现在命令历史或 `ps` 中。传输成功后，客户端会按服务器 `IP:端口` 把凭据保存到 `~/.config/udpfile/clients/`。后续下载无需再次提供令牌：
+客户端会通过终端无回显地提示粘贴令牌，令牌不会出现在命令历史或 `ps` 中。传输成功后，客户端会按服务器 `IP:端口` 把凭据保存到上述系统配置目录的 `clients/` 中。后续下载无需再次提供令牌：
 
 ```bash
 udpfile client \
