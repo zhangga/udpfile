@@ -18,15 +18,15 @@ import (
 	"udpfile/internal/webui"
 )
 
-func runWeb(arguments []string, output, diagnostics io.Writer) error {
+func runWeb(commandName string, arguments []string, output, diagnostics io.Writer) error {
 	if err := appconfig.LoadDefault(); err != nil {
 		return fmt.Errorf("加载 .env：%w", err)
 	}
-	environmentPort, err := appconfig.Int("UDPFILE_TARGET_PORT", 9000)
+	environmentPort, err := appconfig.Int("UDPFILE_TARGET_PORT", 30033)
 	if err != nil {
 		return err
 	}
-	flags := newFlagSet("web", diagnostics)
+	flags := newFlagSet(commandName, diagnostics)
 	listenAddress := flags.String("listen", appconfig.String("UDPFILE_WEB_LISTEN", "127.0.0.1:8080"), "本地 Web 监听地址（仅允许回环地址）")
 	defaultServer := flags.String("server", appconfig.String("UDPFILE_TARGET_IP", ""), "页面中预填的目标 UDP 服务器 IP")
 	defaultPort := flags.Int("port", environmentPort, "页面中预填的目标 UDP 端口")
@@ -42,7 +42,7 @@ func runWeb(arguments []string, output, diagnostics io.Writer) error {
 	if err != nil {
 		return err
 	}
-	logger := log.New(output, "udpfile web: ", log.LstdFlags)
+	logger := log.New(output, "udpfile client: ", log.LstdFlags)
 	handlerConfig := webui.Config{
 		DefaultServer:   *defaultServer,
 		DefaultPort:     *defaultPort,

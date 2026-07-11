@@ -11,9 +11,14 @@ import (
 )
 
 func runKeygen(arguments []string, output, diagnostics io.Writer) error {
+	configurationDirectory, err := appconfig.DefaultConfigDirectory()
+	if err != nil {
+		return err
+	}
+	manualDirectory := filepath.Join(configurationDirectory, "manual")
 	flags := newFlagSet("keygen", diagnostics)
-	keyDirectory := flags.String("keys", "keys", "RSA 密钥输出目录")
-	environmentPath := flags.String("env", ".env", "环境配置输出路径")
+	keyDirectory := flags.String("keys", filepath.Join(manualDirectory, "keys"), "RSA 密钥输出目录")
+	environmentPath := flags.String("env", filepath.Join(manualDirectory, ".env"), "环境配置输出路径")
 	rsaBits := flags.Int("rsa-bits", 3072, "RSA 密钥位数（2048 至 4096）")
 	if err := flags.Parse(arguments); err != nil {
 		return err
@@ -28,11 +33,11 @@ func runKeygen(arguments []string, output, diagnostics io.Writer) error {
 		return err
 	}
 	configuration := fmt.Sprintf(`# udpfile 安全配置；不要提交此文件或 server-private.pem
-UDPFILE_SERVER_ADDR=127.0.0.1:9000
-UDPFILE_ROOT=./shared
+UDPFILE_SERVER_ADDR=0.0.0.0:30033
+UDPFILE_ROOT=.
 UDPFILE_WEB_LISTEN=127.0.0.1:8080
 UDPFILE_TARGET_IP=127.0.0.1
-UDPFILE_TARGET_PORT=9000
+UDPFILE_TARGET_PORT=30033
 UDPFILE_SHARED_SECRET=%s
 UDPFILE_RSA_PRIVATE_KEY=%s
 UDPFILE_RSA_PUBLIC_KEY=%s
@@ -51,5 +56,6 @@ UDPFILE_RSA_PUBLIC_KEY=%s
 		return fmt.Errorf("关闭 %s：%w", *environmentPath, err)
 	}
 	fmt.Fprintf(output, "已生成 %s、%s 和 %s\n", material.PrivateKeyPath, material.PublicKeyPath, *environmentPath)
+	fmt.Fprintf(output, "使用此配置启动：UDPFILE_ENV=%q udpfile server\n", *environmentPath)
 	return nil
 }

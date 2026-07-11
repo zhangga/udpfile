@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -21,16 +22,16 @@ import (
 	"udpfile/internal/pairing"
 )
 
-func runClient(arguments []string, output, diagnostics io.Writer) error {
+func runDownload(arguments []string, output, diagnostics io.Writer) error {
 	if err := appconfig.LoadDefault(); err != nil {
 		return fmt.Errorf("加载 .env：%w", err)
 	}
-	environmentPort, err := appconfig.Int("UDPFILE_TARGET_PORT", 9000)
+	environmentPort, err := appconfig.Int("UDPFILE_TARGET_PORT", 30033)
 	if err != nil {
 		return err
 	}
 	defaultServerAddress := net.JoinHostPort(appconfig.String("UDPFILE_TARGET_IP", "127.0.0.1"), strconv.Itoa(environmentPort))
-	flags := newFlagSet("client", diagnostics)
+	flags := newFlagSet("download", diagnostics)
 	serverAddress := flags.String("server", defaultServerAddress, "UDP 服务器地址")
 	requestedPath := flags.String("path", "", "服务器共享根目录下的相对文件夹路径")
 	destination := flags.String("out", "", "本地输出目录（必须尚不存在）")
@@ -41,9 +42,12 @@ func runClient(arguments []string, output, diagnostics io.Writer) error {
 	if err := flags.Parse(arguments); err != nil {
 		return err
 	}
-	if *requestedPath == "" || *destination == "" {
+	if *requestedPath == "" {
 		flags.Usage()
-		return errors.New("必须同时提供 -path 和 -out")
+		return errors.New("必须提供 -path")
+	}
+	if *destination == "" {
+		*destination = defaultDownloadDestination(*requestedPath)
 	}
 	sharedSecret, serverIdentity, credentialStore, shouldCache, err := resolveClientCredentials(
 		*serverAddress,
@@ -55,7 +59,7 @@ func runClient(arguments []string, output, diagnostics io.Writer) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
-	logger := log.New(output, "udpfile client: ", log.LstdFlags)
+	logger := log.New(output, "udpfile download: ", log.LstdFlags)
 	if err := client.Receive(ctx, client.Config{
 		ServerAddress:  *serverAddress,
 		RequestedPath:  *requestedPath,
@@ -75,6 +79,14 @@ func runClient(arguments []string, output, diagnostics io.Writer) error {
 		logger.Printf("已保存 %s 的配对凭据，后续无需再次输入令牌", *serverAddress)
 	}
 	return nil
+}
+
+func defaultDownloadDestination(requestedPath string) string {
+	base := filepath.Base(filepath.Clean(requestedPath))
+	if base == "." || base == ".." || base == string(filepath.Separator) || base == "" {
+		base = "shared"
+	}
+	return filepath.Join(".", base)
 }
 
 func resolveClientCredentials(serverAddress, pairingToken, pairingFile string) ([]byte, *rsa.PublicKey, *appconfig.ClientCredentialStore, bool, error) {

@@ -58,6 +58,22 @@ func TestHomePageCollectsUDPServerAndDirectory(t *testing.T) {
 	}
 }
 
+func TestHomePageDefaultsToUDPPort30033(t *testing.T) {
+	handler, err := webui.NewHandler(webui.Config{
+		SharedSecret:   webTestSecret,
+		ServerIdentity: &webRSAIdentity(t).PublicKey,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/", nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if !strings.Contains(response.Body.String(), `name="port" type="number" min="1" max="65535" value="30033"`) {
+		t.Fatalf("home page does not default to UDP port 30033: %s", response.Body.String())
+	}
+}
+
 func TestDownloadPairsThenUsesCachedCredentials(t *testing.T) {
 	root := t.TempDir()
 	source := filepath.Join(root, "documents")

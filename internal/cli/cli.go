@@ -28,9 +28,11 @@ func Run(arguments []string, stdout, stderr io.Writer) error {
 	case "server":
 		err = runServer(arguments[1:], stdout, stderr)
 	case "client":
-		err = runClient(arguments[1:], stdout, stderr)
+		err = runWeb("client", arguments[1:], stdout, stderr)
 	case "web":
-		err = runWeb(arguments[1:], stdout, stderr)
+		err = runWeb("web", arguments[1:], stdout, stderr)
+	case "download":
+		err = runDownload(arguments[1:], stdout, stderr)
 	case "keygen":
 		err = runKeygen(arguments[1:], stdout, stderr)
 	default:
@@ -51,8 +53,9 @@ func writeRootHelp(output io.Writer) {
 
 命令:
   server   启动 UDP 文件服务器
-  client   通过命令行下载并解压目录
-  web      启动仅限本机访问的 Web 下载助手
+  client   启动仅限本机访问的 Web 下载客户端
+  web      client 的兼容别名
+  download 通过命令行下载并解压目录
   keygen   生成 .env、共享密钥和 RSA 密钥
 
 运行 udpfile <command> -help 查看子命令参数。`)

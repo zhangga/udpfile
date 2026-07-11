@@ -21,6 +21,8 @@ import (
 
 func TestClientPairsOnceThenUsesCachedCredentials(t *testing.T) {
 	configurationDirectory := t.TempDir()
+	downloadDirectory := t.TempDir()
+	t.Chdir(downloadDirectory)
 	t.Setenv("UDPFILE_CONFIG_DIR", configurationDirectory)
 	t.Setenv("UDPFILE_ENV", filepath.Join(configurationDirectory, "missing.env"))
 	t.Setenv("UDPFILE_SHARED_SECRET", "")
@@ -51,9 +53,9 @@ func TestClientPairsOnceThenUsesCachedCredentials(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	firstDestination := filepath.Join(t.TempDir(), "first")
+	firstDestination := filepath.Join(downloadDirectory, "shared")
 	arguments := []string{
-		"client", "-server", serverAddress, "-path", "shared", "-out", firstDestination,
+		"download", "-server", serverAddress, "-path", "shared",
 		"-pair-file", pairingFile, "-retry", "20ms", "-timeout", "5s",
 	}
 	if err := Run(arguments, io.Discard, io.Discard); err != nil {
@@ -61,9 +63,12 @@ func TestClientPairsOnceThenUsesCachedCredentials(t *testing.T) {
 	}
 	assertPairingTestFile(t, filepath.Join(firstDestination, "hello.txt"), want)
 
-	secondDestination := filepath.Join(t.TempDir(), "second")
+	if err := os.RemoveAll(firstDestination); err != nil {
+		t.Fatal(err)
+	}
+	secondDestination := filepath.Join(downloadDirectory, "shared")
 	arguments = []string{
-		"client", "-server", serverAddress, "-path", "shared", "-out", secondDestination,
+		"download", "-server", serverAddress, "-path", "shared",
 		"-retry", "20ms", "-timeout", "5s",
 	}
 	if err := Run(arguments, io.Discard, io.Discard); err != nil {
@@ -89,7 +94,7 @@ func TestClientRejectsWorldReadablePairingFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	err := Run([]string{
-		"client", "-server", "127.0.0.1:9", "-path", ".",
+		"download", "-server", "127.0.0.1:9", "-path", ".",
 		"-out", filepath.Join(t.TempDir(), "out"), "-pair-file", pairingFile,
 	}, io.Discard, io.Discard)
 	if err == nil || !strings.Contains(err.Error(), "0600") {

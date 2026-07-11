@@ -21,7 +21,7 @@ func runServer(arguments []string, output, diagnostics io.Writer) error {
 		return fmt.Errorf("加载 .env：%w", err)
 	}
 	flags := newFlagSet("server", diagnostics)
-	address := flags.String("addr", appconfig.String("UDPFILE_SERVER_ADDR", "127.0.0.1:9000"), "UDP 监听地址")
+	address := flags.String("addr", appconfig.String("UDPFILE_SERVER_ADDR", "0.0.0.0:30033"), "UDP 监听地址")
 	root := flags.String("root", appconfig.String("UDPFILE_ROOT", "."), "允许客户端读取的根目录")
 	maxBytes := flags.Int64("max-bytes", 10<<30, "单次请求允许读取的源文件总字节数")
 	maxSessions := flags.Int("max-sessions", 32, "最大并发传输会话数")

@@ -12,7 +12,7 @@ func TestRootHelpListsAllModes(t *testing.T) {
 	if err := Run([]string{"help"}, &output, &output); err != nil {
 		t.Fatalf("Run(help) error = %v", err)
 	}
-	for _, command := range []string{"server", "client", "web", "keygen"} {
+	for _, command := range []string{"server", "client", "web", "download", "keygen"} {
 		if !strings.Contains(output.String(), command) {
 			t.Errorf("root help does not list %q", command)
 		}
@@ -59,8 +59,9 @@ func TestSubcommandHelpUsesIndependentFlags(t *testing.T) {
 		flag    string
 	}{
 		{"server", "-root"},
-		{"client", "-path"},
+		{"client", "-listen"},
 		{"web", "-listen"},
+		{"download", "-path"},
 		{"keygen", "-rsa-bits"},
 	} {
 		var output bytes.Buffer
@@ -70,6 +71,26 @@ func TestSubcommandHelpUsesIndependentFlags(t *testing.T) {
 		if !strings.Contains(output.String(), test.flag) {
 			t.Errorf("%s help does not contain %q", test.command, test.flag)
 		}
+	}
+}
+
+func TestZeroArgumentRoleDefaultsAreVisibleInHelp(t *testing.T) {
+	configurationDirectory := t.TempDir()
+	t.Setenv("UDPFILE_ENV", filepath.Join(configurationDirectory, "missing.env"))
+	var serverHelp bytes.Buffer
+	if err := Run([]string{"server", "-help"}, &serverHelp, &serverHelp); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(serverHelp.String(), "0.0.0.0:30033") || !strings.Contains(serverHelp.String(), `default "."`) {
+		t.Fatalf("server help = %q, want zero-argument address and root defaults", serverHelp.String())
+	}
+
+	var clientHelp bytes.Buffer
+	if err := Run([]string{"client", "-help"}, &clientHelp, &clientHelp); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(clientHelp.String(), "30033") || strings.Contains(clientHelp.String(), "-path") {
+		t.Fatalf("client help = %q, want Web client defaults without CLI download flags", clientHelp.String())
 	}
 }
 

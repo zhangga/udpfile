@@ -77,7 +77,7 @@ type pageData struct {
 
 func NewHandler(config Config) (http.Handler, error) {
 	if config.DefaultPort == 0 {
-		config.DefaultPort = 9000
+		config.DefaultPort = 30033
 	}
 	if config.DefaultPort < 1 || config.DefaultPort > 65535 {
 		return nil, errors.New("default UDP port must be between 1 and 65535")
