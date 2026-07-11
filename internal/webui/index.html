@@ -187,6 +187,21 @@
 
     button:hover { transform: translate(-4px, -4px); background: #dcff94; box-shadow: 7px 7px 0 var(--flare); }
     button:active { transform: translate(0, 0); box-shadow: none; }
+    button:disabled { cursor: wait; opacity: .7; transform: none; box-shadow: none; }
+
+    .transfer-progress {
+      margin-top: 18px;
+      padding: 14px;
+      border: 1px solid var(--line);
+      background: #0b0e0c;
+    }
+    .transfer-progress[hidden] { display: none; }
+    .progress-head { display: flex; justify-content: space-between; gap: 16px; margin-bottom: 10px; font-size: 10px; }
+    .progress-head span:first-child { color: var(--signal); }
+    .progress-head span:last-child { color: var(--muted); }
+    .progress-track { height: 8px; overflow: hidden; background: var(--line); }
+    .progress-bar { width: 0; height: 100%; background: var(--signal); transition: width .2s ease; }
+    .progress-detail { margin: 10px 0 0; color: var(--muted); font-size: 10px; line-height: 1.5; }
 
     .note { margin: 18px 0 0; color: var(--muted); font-size: 10px; line-height: 1.65; }
     .note strong { color: var(--flare); font-weight: 500; }
@@ -239,8 +254,9 @@
           <h2 id="download-title">建立接收任务</h2>
           <span class="packet">PKT 0000 → READY</span>
         </div>
-        <form action="/download" method="post" target="_blank">
+        <form id="download-form" action="/download" method="post" target="_blank">
           <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+          <input id="task-id" type="hidden" name="task_id" value="">
           <div class="endpoint">
             <label>
               <span>目标服务器 IP</span>
@@ -259,11 +275,96 @@
             <span>首次配对令牌（已配对可留空）</span>
             <input name="pair" type="password" placeholder="UDF2-..." autocomplete="off">
           </label>
-          <button type="submit">下载目录 ↘</button>
+          <button id="download-button" type="submit">下载目录 ↘</button>
         </form>
+        <div id="transfer-progress" class="transfer-progress" role="status" aria-live="polite" hidden>
+          <div class="progress-head"><span id="progress-state">准备连接</span><span id="progress-percent">0%</span></div>
+          <div class="progress-track" aria-hidden="true"><div id="progress-bar" class="progress-bar"></div></div>
+          <p id="progress-detail" class="progress-detail">正在创建安全 UDP 会话…</p>
+        </div>
         <p class="note"><strong>注意：</strong>首次连接需粘贴服务器显示的配对令牌，成功后本机会安全保存。下载会在新窗口启动；本地 HTTP 仅绑定 127.0.0.1，不会暴露给局域网。</p>
       </section>
     </main>
   </div>
+  <script nonce="{{.CSPNonce}}">
+    const form = document.getElementById('download-form');
+    const taskInput = document.getElementById('task-id');
+    const button = document.getElementById('download-button');
+    const panel = document.getElementById('transfer-progress');
+    const stateLabel = document.getElementById('progress-state');
+    const percentLabel = document.getElementById('progress-percent');
+    const detailLabel = document.getElementById('progress-detail');
+    const bar = document.getElementById('progress-bar');
+    let activeTask = '';
+
+    function newTaskID() {
+      return Array.from(crypto.getRandomValues(new Uint8Array(16)), value => value.toString(16).padStart(2, '0')).join('');
+    }
+
+    function formatBytes(value) {
+      if (value >= 1073741824) return (value / 1073741824).toFixed(2) + ' GiB';
+      if (value >= 1048576) return (value / 1048576).toFixed(2) + ' MiB';
+      if (value >= 1024) return (value / 1024).toFixed(2) + ' KiB';
+      return value + ' B';
+    }
+
+    function renderProgress(progress) {
+      const percent = Math.max(0, Math.min(100, progress.percent || 0));
+      percentLabel.textContent = percent + '%';
+      bar.style.width = percent + '%';
+      if (progress.status === 'completed') {
+        stateLabel.textContent = '接收完成';
+        detailLabel.textContent = 'UDP 数据已接收并校验，浏览器正在保存压缩包。';
+        button.disabled = false;
+        return false;
+      }
+      if (progress.status === 'failed') {
+        stateLabel.textContent = '传输失败';
+        detailLabel.textContent = '请查看新打开窗口中的错误信息，然后重试。';
+        button.disabled = false;
+        return false;
+      }
+      if (progress.status === 'downloading') {
+        stateLabel.textContent = '正在接收';
+        detailLabel.textContent = formatBytes(progress.completed_bytes) + ' / ' + formatBytes(progress.total_bytes) + ' · ' + progress.completed_chunks + ' / ' + progress.total_chunks + ' 分片';
+      } else {
+        stateLabel.textContent = '正在协商密钥';
+        detailLabel.textContent = '正在创建安全 UDP 会话…';
+      }
+      return true;
+    }
+
+    async function pollProgress(taskID, missingAttempts) {
+      if (activeTask !== taskID) return;
+      try {
+        const response = await fetch('/progress?id=' + encodeURIComponent(taskID), {cache: 'no-store'});
+        if (response.status === 404 && missingAttempts < 20) {
+          window.setTimeout(() => pollProgress(taskID, missingAttempts + 1), 250);
+          return;
+        }
+        if (!response.ok) throw new Error('progress endpoint returned ' + response.status);
+        const progress = await response.json();
+        if (renderProgress(progress)) {
+          window.setTimeout(() => pollProgress(taskID, 0), 400);
+        }
+      } catch (error) {
+        stateLabel.textContent = '无法读取进度';
+        detailLabel.textContent = '下载窗口仍可能继续传输，请检查客户端终端日志。';
+        button.disabled = false;
+      }
+    }
+
+    form.addEventListener('submit', () => {
+      activeTask = newTaskID();
+      taskInput.value = activeTask;
+      panel.hidden = false;
+      stateLabel.textContent = '准备连接';
+      percentLabel.textContent = '0%';
+      detailLabel.textContent = '正在创建安全 UDP 会话…';
+      bar.style.width = '0%';
+      button.disabled = true;
+      window.setTimeout(() => pollProgress(activeTask, 0), 150);
+    });
+  </script>
 </body>
 </html>

@@ -46,7 +46,8 @@ func TestHomePageCollectsUDPServerAndDirectory(t *testing.T) {
 	body := response.Body.String()
 	for _, expected := range []string{
 		`<form`, `action="/download"`, `method="post"`,
-		`name="server"`, `name="port"`, `name="path"`, `name="pair"`, `name="csrf_token"`,
+		`name="server"`, `name="port"`, `name="path"`, `name="pair"`, `name="csrf_token"`, `name="task_id"`,
+		`id="transfer-progress"`, `/progress?id=`,
 		`UDP 文件接收站`, `下载目录`,
 	} {
 		if !strings.Contains(body, expected) {
@@ -55,6 +56,96 @@ func TestHomePageCollectsUDPServerAndDirectory(t *testing.T) {
 	}
 	if got := response.Header().Get("Content-Security-Policy"); got == "" {
 		t.Error("GET / did not set Content-Security-Policy")
+	}
+	nonceMatch := regexp.MustCompile(`nonce="([^"]+)"`).FindStringSubmatch(body)
+	csrfMatch := regexp.MustCompile(`name="csrf_token" value="([^"]+)"`).FindStringSubmatch(body)
+	if len(nonceMatch) != 2 || len(csrfMatch) != 2 {
+		t.Fatalf("home page is missing CSP nonce or CSRF token")
+	}
+	if nonceMatch[1] == csrfMatch[1] {
+		t.Fatal("CSP nonce must be independent from CSRF token")
+	}
+	if !strings.Contains(response.Header().Get("Content-Security-Policy"), "'nonce-"+nonceMatch[1]+"'") {
+		t.Fatal("Content-Security-Policy does not authorize the rendered script nonce")
+	}
+}
+
+func TestDownloadExposesCompletedBrowserProgress(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "documents")
+	mustMkdirAll(t, source)
+	mustWriteFile(t, filepath.Join(source, "progress.txt"), bytes.Repeat([]byte("progress\n"), 256))
+	udpAddress, stopServer := startUDPServer(t, root)
+	defer stopServer()
+
+	handler, err := webui.NewHandler(webui.Config{
+		DefaultPort:    udpAddress.Port,
+		SharedSecret:   webTestSecret,
+		ServerIdentity: &webRSAIdentity(t).PublicKey,
+		Logger:         log.New(io.Discard, "", 0),
+	})
+	if err != nil {
+		t.Fatalf("NewHandler() error = %v", err)
+	}
+	taskID := strings.Repeat("a", 32)
+	form := url.Values{
+		"csrf_token": {readCSRFToken(t, handler)},
+		"task_id":    {taskID},
+		"server":     {"127.0.0.1"},
+		"port":       {strconv.Itoa(udpAddress.Port)},
+		"path":       {"documents"},
+	}
+	request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/download", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("POST /download status = %d; body=%s", response.Code, response.Body.String())
+	}
+
+	progressRequest := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/progress?id="+taskID, nil)
+	progressResponse := httptest.NewRecorder()
+	handler.ServeHTTP(progressResponse, progressRequest)
+	if progressResponse.Code != http.StatusOK {
+		t.Fatalf("GET /progress status = %d; body=%s", progressResponse.Code, progressResponse.Body.String())
+	}
+	body := progressResponse.Body.String()
+	for _, expected := range []string{`"status":"completed"`, `"percent":100`, `"completed_bytes":`, `"total_bytes":`, `"completed_chunks":`, `"total_chunks":`} {
+		if !strings.Contains(body, expected) {
+			t.Errorf("GET /progress body does not contain %q: %s", expected, body)
+		}
+	}
+}
+
+func TestDownloadFailureIsExposedToBrowserProgress(t *testing.T) {
+	handler, err := webui.NewHandler(webui.Config{
+		CredentialStore: &memoryCredentialStore{},
+		Logger:          log.New(io.Discard, "", 0),
+	})
+	if err != nil {
+		t.Fatalf("NewHandler() error = %v", err)
+	}
+	taskID := strings.Repeat("b", 32)
+	form := url.Values{
+		"csrf_token": {readCSRFToken(t, handler)},
+		"task_id":    {taskID},
+		"server":     {"127.0.0.1"},
+		"port":       {"30033"},
+		"path":       {"documents"},
+	}
+	request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/download", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("POST /download status = %d; body=%s", response.Code, response.Body.String())
+	}
+
+	progressRequest := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/progress?id="+taskID, nil)
+	progressResponse := httptest.NewRecorder()
+	handler.ServeHTTP(progressResponse, progressRequest)
+	if progressResponse.Code != http.StatusOK || !strings.Contains(progressResponse.Body.String(), `"status":"failed"`) {
+		t.Fatalf("failed progress status = %d; body=%s", progressResponse.Code, progressResponse.Body.String())
 	}
 }
 

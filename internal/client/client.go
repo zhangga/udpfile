@@ -34,6 +34,7 @@ type Config struct {
 	SharedSecret   []byte
 	ServerIdentity *rsa.PublicKey
 	Logger         *log.Logger
+	Progress       func(transferprogress.Snapshot)
 }
 
 type ArchiveInfo struct {
@@ -158,6 +159,7 @@ func downloadArchive(ctx context.Context, config Config, destination io.Writer) 
 		config.Logger.Printf("receiving %d bytes in %d chunks", meta.Size, meta.Chunks)
 	}
 	progressReporter := transferprogress.New(config.Logger, "接收", meta.Size, meta.Chunks)
+	progressReporter.Observe(config.Progress)
 	progressReporter.Report(0, 0)
 
 	hash := sha256.New()

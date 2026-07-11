@@ -8,6 +8,7 @@ import (
 	_ "embed"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"html/template"
@@ -20,10 +21,12 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"udpfile/internal/client"
 	"udpfile/internal/pairing"
+	transferprogress "udpfile/internal/progress"
 )
 
 //go:embed index.html
@@ -32,6 +35,8 @@ var indexHTML string
 const (
 	DefaultRetryInterval = client.DefaultRetryInterval
 	DefaultMaxArchive    = client.DefaultMaxArchive
+	progressRetention    = 10 * time.Minute
+	maxRetainedTransfers = 128
 )
 
 type Config struct {
@@ -67,10 +72,23 @@ type Handler struct {
 	credentialStore CredentialStore
 	downloadSlots   chan struct{}
 	logger          *log.Logger
+	progressMu      sync.Mutex
+	transfers       map[string]browserProgress
+}
+
+type browserProgress struct {
+	Status          string    `json:"status"`
+	Percent         int       `json:"percent"`
+	CompletedBytes  uint64    `json:"completed_bytes"`
+	TotalBytes      uint64    `json:"total_bytes"`
+	CompletedChunks uint32    `json:"completed_chunks"`
+	TotalChunks     uint32    `json:"total_chunks"`
+	UpdatedAt       time.Time `json:"-"`
 }
 
 type pageData struct {
 	CSRFToken     string
+	CSPNonce      string
 	DefaultServer string
 	DefaultPort   int
 }
@@ -114,8 +132,8 @@ func NewHandler(config Config) (http.Handler, error) {
 	if config.MaxConcurrent <= 0 {
 		config.MaxConcurrent = 2
 	}
-	tokenBytes := make([]byte, 32)
-	if _, err := rand.Read(tokenBytes); err != nil {
+	csrfToken, err := randomToken(32)
+	if err != nil {
 		return nil, err
 	}
 	page, err := template.New("index").Parse(indexHTML)
@@ -124,7 +142,7 @@ func NewHandler(config Config) (http.Handler, error) {
 	}
 	return &Handler{
 		page:            page,
-		csrfToken:       base64.RawURLEncoding.EncodeToString(tokenBytes),
+		csrfToken:       csrfToken,
 		defaultServer:   config.DefaultServer,
 		defaultPort:     config.DefaultPort,
 		tempDir:         config.TempDir,
@@ -136,20 +154,32 @@ func NewHandler(config Config) (http.Handler, error) {
 		credentialStore: config.CredentialStore,
 		downloadSlots:   make(chan struct{}, config.MaxConcurrent),
 		logger:          config.Logger,
+		transfers:       make(map[string]browserProgress),
 	}, nil
 }
 
 func (handler *Handler) ServeHTTP(response http.ResponseWriter, request *http.Request) {
-	setSecurityHeaders(response)
+	nonce := ""
+	if request.URL.Path == "/" {
+		var err error
+		nonce, err = randomToken(18)
+		if err != nil {
+			http.Error(response, "无法生成页面安全令牌", http.StatusInternalServerError)
+			return
+		}
+	}
+	handler.setSecurityHeaders(response, nonce)
 	if !requestHostIsLoopback(request.Host) {
 		http.Error(response, "仅允许通过 localhost 访问", http.StatusForbidden)
 		return
 	}
 	switch request.URL.Path {
 	case "/":
-		handler.serveHome(response, request)
+		handler.serveHome(response, request, nonce)
 	case "/download":
 		handler.serveDownload(response, request)
+	case "/progress":
+		handler.serveProgress(response, request)
 	default:
 		http.NotFound(response, request)
 	}
@@ -169,6 +199,11 @@ func (handler *Handler) serveDownload(response http.ResponseWriter, request *htt
 	providedToken := request.FormValue("csrf_token")
 	if subtle.ConstantTimeCompare([]byte(providedToken), []byte(handler.csrfToken)) != 1 {
 		http.Error(response, "页面令牌已失效，请刷新后重试", http.StatusForbidden)
+		return
+	}
+	taskID := strings.TrimSpace(request.FormValue("task_id"))
+	if taskID != "" && !validTaskID(taskID) {
+		http.Error(response, "下载任务编号无效", http.StatusBadRequest)
 		return
 	}
 
@@ -194,6 +229,19 @@ func (handler *Handler) serveDownload(response http.ResponseWriter, request *htt
 	default:
 		http.Error(response, "本机已有过多下载任务，请稍后重试", http.StatusTooManyRequests)
 		return
+	}
+	tracked := taskID != ""
+	transferFinished := false
+	if tracked {
+		if !handler.beginTransfer(taskID) {
+			http.Error(response, "下载任务编号已存在或任务记录已满", http.StatusConflict)
+			return
+		}
+		defer func() {
+			if !transferFinished {
+				handler.finishTransfer(taskID, "failed")
+			}
+		}()
 	}
 
 	temporary, err := os.CreateTemp(handler.tempDir, "udpfile-web-*.tar.gz")
@@ -253,6 +301,7 @@ func (handler *Handler) serveDownload(response http.ResponseWriter, request *htt
 		SharedSecret:   sharedSecret,
 		ServerIdentity: serverIdentity,
 		Logger:         handler.logger,
+		Progress:       handler.progressObserver(taskID),
 	}, temporary)
 	cancel()
 	if downloadErr != nil {
@@ -279,6 +328,10 @@ func (handler *Handler) serveDownload(response http.ResponseWriter, request *htt
 		http.Error(response, "无法读取本地临时文件", http.StatusInternalServerError)
 		return
 	}
+	if tracked {
+		handler.finishTransfer(taskID, "completed")
+		transferFinished = true
+	}
 
 	filename := downloadFilename(requestedPath)
 	response.Header().Set("Content-Type", "application/gzip")
@@ -289,6 +342,121 @@ func (handler *Handler) serveDownload(response http.ResponseWriter, request *htt
 	if _, err := io.Copy(response, temporary); err != nil {
 		handler.logger.Printf("send browser download %q: %v", filename, err)
 	}
+}
+
+func (handler *Handler) serveProgress(response http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodGet {
+		response.Header().Set("Allow", http.MethodGet)
+		http.Error(response, "仅支持 GET", http.StatusMethodNotAllowed)
+		return
+	}
+	taskID := strings.TrimSpace(request.URL.Query().Get("id"))
+	if !validTaskID(taskID) {
+		http.Error(response, "下载任务编号无效", http.StatusBadRequest)
+		return
+	}
+	handler.progressMu.Lock()
+	handler.removeExpiredTransfersLocked(time.Now())
+	progress, ok := handler.transfers[taskID]
+	handler.progressMu.Unlock()
+	if !ok {
+		http.Error(response, "下载任务不存在", http.StatusNotFound)
+		return
+	}
+	response.Header().Set("Content-Type", "application/json; charset=utf-8")
+	response.Header().Set("Cache-Control", "no-store")
+	if err := json.NewEncoder(response).Encode(progress); err != nil {
+		handler.logger.Printf("write browser progress: %v", err)
+	}
+}
+
+func (handler *Handler) beginTransfer(taskID string) bool {
+	handler.progressMu.Lock()
+	defer handler.progressMu.Unlock()
+	now := time.Now()
+	handler.removeExpiredTransfersLocked(now)
+	if _, exists := handler.transfers[taskID]; exists {
+		return false
+	}
+	if len(handler.transfers) >= maxRetainedTransfers && !handler.removeOldestTerminalTransferLocked() {
+		return false
+	}
+	handler.transfers[taskID] = browserProgress{Status: "starting", UpdatedAt: now}
+	return true
+}
+
+func (handler *Handler) progressObserver(taskID string) func(transferprogress.Snapshot) {
+	if taskID == "" {
+		return nil
+	}
+	return func(snapshot transferprogress.Snapshot) {
+		handler.progressMu.Lock()
+		progress, ok := handler.transfers[taskID]
+		if ok {
+			progress.Status = "downloading"
+			progress.Percent = snapshot.Percent
+			progress.CompletedBytes = snapshot.CompletedBytes
+			progress.TotalBytes = snapshot.TotalBytes
+			progress.CompletedChunks = snapshot.CompletedChunks
+			progress.TotalChunks = snapshot.TotalChunks
+			progress.UpdatedAt = time.Now()
+			handler.transfers[taskID] = progress
+		}
+		handler.progressMu.Unlock()
+	}
+}
+
+func (handler *Handler) finishTransfer(taskID string, status string) {
+	handler.progressMu.Lock()
+	progress, ok := handler.transfers[taskID]
+	if ok {
+		progress.Status = status
+		if status == "completed" {
+			progress.Percent = 100
+		}
+		progress.UpdatedAt = time.Now()
+		handler.transfers[taskID] = progress
+	}
+	handler.progressMu.Unlock()
+}
+
+func (handler *Handler) removeExpiredTransfersLocked(now time.Time) {
+	for taskID, progress := range handler.transfers {
+		if isTerminalProgress(progress.Status) && now.Sub(progress.UpdatedAt) > progressRetention {
+			delete(handler.transfers, taskID)
+		}
+	}
+}
+
+func (handler *Handler) removeOldestTerminalTransferLocked() bool {
+	oldestTaskID := ""
+	var oldestUpdate time.Time
+	for taskID, progress := range handler.transfers {
+		if !isTerminalProgress(progress.Status) {
+			continue
+		}
+		if oldestTaskID == "" || progress.UpdatedAt.Before(oldestUpdate) {
+			oldestTaskID = taskID
+			oldestUpdate = progress.UpdatedAt
+		}
+	}
+	if oldestTaskID == "" {
+		return false
+	}
+	delete(handler.transfers, oldestTaskID)
+	return true
+}
+
+func isTerminalProgress(status string) bool {
+	return status == "completed" || status == "failed"
+}
+
+func validTaskID(taskID string) bool {
+	if len(taskID) != 32 {
+		return false
+	}
+	_, err := hex.DecodeString(taskID)
+	return err == nil
 }
 
 func downloadFilename(requestedPath string) string {
@@ -308,7 +476,7 @@ func downloadFilename(requestedPath string) string {
 	return base + ".tar.gz"
 }
 
-func (handler *Handler) serveHome(response http.ResponseWriter, request *http.Request) {
+func (handler *Handler) serveHome(response http.ResponseWriter, request *http.Request, nonce string) {
 	if request.Method != http.MethodGet {
 		response.Header().Set("Allow", http.MethodGet)
 		http.Error(response, "仅支持 GET", http.StatusMethodNotAllowed)
@@ -318,6 +486,7 @@ func (handler *Handler) serveHome(response http.ResponseWriter, request *http.Re
 	response.Header().Set("Cache-Control", "no-store")
 	if err := handler.page.Execute(response, pageData{
 		CSRFToken:     handler.csrfToken,
+		CSPNonce:      nonce,
 		DefaultServer: handler.defaultServer,
 		DefaultPort:   handler.defaultPort,
 	}); err != nil {
@@ -325,11 +494,23 @@ func (handler *Handler) serveHome(response http.ResponseWriter, request *http.Re
 	}
 }
 
-func setSecurityHeaders(response http.ResponseWriter) {
-	response.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
+func (handler *Handler) setSecurityHeaders(response http.ResponseWriter, nonce string) {
+	policy := "default-src 'none'; style-src 'unsafe-inline'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
+	if nonce != "" {
+		policy += "; script-src 'nonce-" + nonce + "'"
+	}
+	response.Header().Set("Content-Security-Policy", policy)
 	response.Header().Set("Referrer-Policy", "no-referrer")
 	response.Header().Set("X-Content-Type-Options", "nosniff")
 	response.Header().Set("X-Frame-Options", "DENY")
+}
+
+func randomToken(byteCount int) (string, error) {
+	tokenBytes := make([]byte, byteCount)
+	if _, err := rand.Read(tokenBytes); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(tokenBytes), nil
 }
 
 func requestHostIsLoopback(hostPort string) bool {
