@@ -12,6 +12,22 @@ go build -o bin/udpfile-client ./cmd/udpfile-client
 go build -o bin/udpfile-web ./cmd/udpfile-web
 ```
 
+仓库中也包含已交叉编译的静态 Linux x86-64 版本：
+
+```text
+dist/linux-amd64/udpfile-server
+dist/linux-amd64/udpfile-client
+dist/linux-amd64/udpfile-web
+```
+
+在 Linux 上校验后即可运行：
+
+```bash
+cd dist/linux-amd64
+sha256sum -c SHA256SUMS
+./udpfile-server -help
+```
+
 ## 从本地网页下载
 
 假设目标服务器 IP 是 `192.168.1.20`，需要共享 `/srv/share`。目标电脑只需启动 UDP 文件服务器：
