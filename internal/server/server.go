@@ -1,0 +1,342 @@
+package server
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"math"
+	"net"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
+
+	archivefile "udpfile/internal/archive"
+	"udpfile/internal/protocol"
+)
+
+const (
+	defaultMaxSourceBytes = int64(10 << 30)
+	defaultSessionTTL     = 5 * time.Minute
+	defaultMaxSessions    = 32
+)
+
+type Config struct {
+	Root           string
+	TempDir        string
+	MaxSourceBytes int64
+	SessionTTL     time.Duration
+	MaxSessions    int
+	Logger         *log.Logger
+}
+
+type Server struct {
+	connection *net.UDPConn
+	config     Config
+	root       string
+
+	mu       sync.Mutex
+	sessions map[protocol.RequestID]*session
+}
+
+type session struct {
+	requestedPath string
+	lastAccess    time.Time
+	preparing     bool
+	file          *os.File
+	filePath      string
+	meta          protocol.Meta
+}
+
+func New(connection *net.UDPConn, config Config) (*Server, error) {
+	if connection == nil {
+		return nil, errors.New("UDP connection is required")
+	}
+	if config.Root == "" {
+		return nil, errors.New("shared root is required")
+	}
+	root, err := filepath.Abs(config.Root)
+	if err != nil {
+		return nil, fmt.Errorf("resolve shared root: %w", err)
+	}
+	root, err = filepath.EvalSymlinks(root)
+	if err != nil {
+		return nil, fmt.Errorf("resolve shared root: %w", err)
+	}
+	stat, err := os.Stat(root)
+	if err != nil {
+		return nil, fmt.Errorf("stat shared root: %w", err)
+	}
+	if !stat.IsDir() {
+		return nil, errors.New("shared root is not a directory")
+	}
+	if config.MaxSourceBytes <= 0 {
+		config.MaxSourceBytes = defaultMaxSourceBytes
+	}
+	if config.SessionTTL <= 0 {
+		config.SessionTTL = defaultSessionTTL
+	}
+	if config.MaxSessions <= 0 {
+		config.MaxSessions = defaultMaxSessions
+	}
+	if config.TempDir == "" {
+		config.TempDir = os.TempDir()
+	}
+	if config.Logger == nil {
+		config.Logger = log.New(io.Discard, "", 0)
+	}
+	return &Server{
+		connection: connection,
+		config:     config,
+		root:       root,
+		sessions:   make(map[protocol.RequestID]*session),
+	}, nil
+}
+
+func (server *Server) Serve(ctx context.Context) error {
+	defer server.closeSessions()
+	buffer := make([]byte, protocol.MaxDatagramSize+1)
+	lastCleanup := time.Now()
+	for {
+		if err := server.connection.SetReadDeadline(time.Now().Add(500 * time.Millisecond)); err != nil {
+			return fmt.Errorf("set UDP read deadline: %w", err)
+		}
+		length, clientAddress, err := server.connection.ReadFromUDP(buffer)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			var networkError net.Error
+			if errors.As(err, &networkError) && networkError.Timeout() {
+				server.cleanupExpired()
+				continue
+			}
+			if errors.Is(err, net.ErrClosed) {
+				return nil
+			}
+			return fmt.Errorf("read UDP packet: %w", err)
+		}
+		packet := append([]byte(nil), buffer[:length]...)
+		packetType, _, err := protocol.Header(packet)
+		if err != nil {
+			server.config.Logger.Printf("ignored malformed packet from %s: %v", clientAddress, err)
+			continue
+		}
+		switch packetType {
+		case protocol.TypeRequest:
+			server.handleRequest(packet, clientAddress)
+		case protocol.TypeGet:
+			server.handleGet(packet, clientAddress)
+		case protocol.TypeDone:
+			server.handleDone(packet, clientAddress)
+		default:
+			server.config.Logger.Printf("ignored unexpected packet type %d from %s", packetType, clientAddress)
+		}
+		if time.Since(lastCleanup) >= time.Second {
+			server.cleanupExpired()
+			lastCleanup = time.Now()
+		}
+	}
+}
+
+func (server *Server) handleRequest(packet []byte, clientAddress *net.UDPAddr) {
+	id, requestedPath, err := protocol.DecodeRequest(packet)
+	if err != nil {
+		return
+	}
+
+	server.mu.Lock()
+	if existing, ok := server.sessions[id]; ok {
+		existing.lastAccess = time.Now()
+		if existing.requestedPath != requestedPath {
+			server.mu.Unlock()
+			server.sendError(id, clientAddress, "request ID was reused with a different path")
+			return
+		}
+		if !existing.preparing {
+			meta := existing.meta
+			server.mu.Unlock()
+			server.sendMeta(id, meta, clientAddress)
+			return
+		}
+		server.mu.Unlock()
+		return
+	}
+	if len(server.sessions) >= server.config.MaxSessions {
+		server.mu.Unlock()
+		server.sendError(id, clientAddress, "server is busy; try again later")
+		return
+	}
+	now := time.Now()
+	current := &session{requestedPath: requestedPath, lastAccess: now, preparing: true}
+	server.sessions[id] = current
+	server.mu.Unlock()
+
+	server.config.Logger.Printf("preparing %q for %s", requestedPath, clientAddress)
+	go server.prepare(id, current, clientAddress)
+}
+
+func (server *Server) prepare(id protocol.RequestID, current *session, clientAddress *net.UDPAddr) {
+	temporary, err := os.CreateTemp(server.config.TempDir, "udpfile-*.tar.gz")
+	if err != nil {
+		server.failPreparation(id, current, clientAddress, fmt.Errorf("create temporary archive: %w", err))
+		return
+	}
+	archivePath := temporary.Name()
+	if closeErr := temporary.Close(); closeErr != nil {
+		_ = os.Remove(archivePath)
+		server.failPreparation(id, current, clientAddress, fmt.Errorf("close temporary archive: %w", closeErr))
+		return
+	}
+
+	archiveInfo, err := archivefile.Create(server.root, current.requestedPath, archivePath, server.config.MaxSourceBytes)
+	if err != nil {
+		server.failPreparation(id, current, clientAddress, err)
+		return
+	}
+	chunks := uint64(0)
+	if archiveInfo.Size > 0 {
+		chunks = (uint64(archiveInfo.Size) + protocol.ChunkSize - 1) / protocol.ChunkSize
+	}
+	if chunks > math.MaxUint32 {
+		_ = os.Remove(archivePath)
+		server.failPreparation(id, current, clientAddress, errors.New("archive has too many chunks"))
+		return
+	}
+	input, err := os.Open(archivePath)
+	if err != nil {
+		_ = os.Remove(archivePath)
+		server.failPreparation(id, current, clientAddress, fmt.Errorf("open prepared archive: %w", err))
+		return
+	}
+	meta := protocol.Meta{Size: uint64(archiveInfo.Size), Chunks: uint32(chunks), ChunkSize: protocol.ChunkSize}
+	meta.SHA256 = archiveInfo.SHA256
+
+	server.mu.Lock()
+	if server.sessions[id] != current {
+		server.mu.Unlock()
+		input.Close()
+		os.Remove(archivePath)
+		return
+	}
+	current.preparing = false
+	current.file = input
+	current.filePath = archivePath
+	current.meta = meta
+	current.lastAccess = time.Now()
+	server.mu.Unlock()
+
+	server.config.Logger.Printf("ready %q: %d bytes in %d chunks", current.requestedPath, meta.Size, meta.Chunks)
+	server.sendMeta(id, meta, clientAddress)
+}
+
+func (server *Server) failPreparation(id protocol.RequestID, current *session, clientAddress *net.UDPAddr, err error) {
+	server.mu.Lock()
+	if server.sessions[id] == current {
+		delete(server.sessions, id)
+	}
+	server.mu.Unlock()
+	server.config.Logger.Printf("cannot prepare %q: %v", current.requestedPath, err)
+	server.sendError(id, clientAddress, fmt.Sprintf("cannot send %q: %v", current.requestedPath, err))
+}
+
+func (server *Server) handleGet(packet []byte, clientAddress *net.UDPAddr) {
+	id, index, err := protocol.DecodeGet(packet)
+	if err != nil {
+		return
+	}
+	server.mu.Lock()
+	current, ok := server.sessions[id]
+	if !ok || current.preparing || index >= current.meta.Chunks {
+		server.mu.Unlock()
+		return
+	}
+	current.lastAccess = time.Now()
+	offset := int64(index) * int64(current.meta.ChunkSize)
+	length := int64(current.meta.ChunkSize)
+	if remaining := int64(current.meta.Size) - offset; remaining < length {
+		length = remaining
+	}
+	data := make([]byte, length)
+	read, readErr := current.file.ReadAt(data, offset)
+	server.mu.Unlock()
+	if readErr != nil && !errors.Is(readErr, io.EOF) || read != len(data) {
+		server.sendError(id, clientAddress, "could not read prepared archive")
+		return
+	}
+	response, err := protocol.EncodeData(id, index, data)
+	if err != nil {
+		return
+	}
+	server.send(response, clientAddress)
+}
+
+func (server *Server) handleDone(packet []byte, clientAddress *net.UDPAddr) {
+	id, err := protocol.DecodeDone(packet)
+	if err != nil {
+		return
+	}
+	server.mu.Lock()
+	if current, ok := server.sessions[id]; ok {
+		server.closeSession(current)
+		delete(server.sessions, id)
+	}
+	server.mu.Unlock()
+	acknowledgement, err := protocol.EncodeDone(id)
+	if err == nil {
+		server.send(acknowledgement, clientAddress)
+	}
+}
+
+func (server *Server) sendMeta(id protocol.RequestID, meta protocol.Meta, address *net.UDPAddr) {
+	packet, err := protocol.EncodeMeta(id, meta)
+	if err == nil {
+		server.send(packet, address)
+	}
+}
+
+func (server *Server) sendError(id protocol.RequestID, address *net.UDPAddr, message string) {
+	packet, err := protocol.EncodeError(id, message)
+	if err == nil {
+		server.send(packet, address)
+	}
+}
+
+func (server *Server) send(packet []byte, address *net.UDPAddr) {
+	if _, err := server.connection.WriteToUDP(packet, address); err != nil && !errors.Is(err, net.ErrClosed) {
+		server.config.Logger.Printf("send packet to %s: %v", address, err)
+	}
+}
+
+func (server *Server) cleanupExpired() {
+	cutoff := time.Now().Add(-server.config.SessionTTL)
+	server.mu.Lock()
+	defer server.mu.Unlock()
+	for id, current := range server.sessions {
+		if current.lastAccess.After(cutoff) {
+			continue
+		}
+		server.closeSession(current)
+		delete(server.sessions, id)
+	}
+}
+
+func (server *Server) closeSessions() {
+	server.mu.Lock()
+	defer server.mu.Unlock()
+	for id, current := range server.sessions {
+		server.closeSession(current)
+		delete(server.sessions, id)
+	}
+}
+
+func (server *Server) closeSession(current *session) {
+	if current.file != nil {
+		_ = current.file.Close()
+	}
+	if current.filePath != "" {
+		_ = os.Remove(current.filePath)
+	}
+}
