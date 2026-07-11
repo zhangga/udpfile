@@ -7,19 +7,13 @@
 需要 Go 1.25 或更高版本。
 
 ```bash
-go build -o bin/udpfile-server ./cmd/udpfile-server
-go build -o bin/udpfile-client ./cmd/udpfile-client
-go build -o bin/udpfile-web ./cmd/udpfile-web
-go build -o bin/udpfile-keygen ./cmd/udpfile-keygen
+go build -o bin/udpfile ./cmd/udpfile
 ```
 
 仓库中也包含已交叉编译的静态 Linux x86-64 版本：
 
 ```text
-dist/linux-amd64/udpfile-server
-dist/linux-amd64/udpfile-client
-dist/linux-amd64/udpfile-web
-dist/linux-amd64/udpfile-keygen
+dist/linux-amd64/udpfile
 ```
 
 在 Linux 上校验后即可运行：
@@ -27,7 +21,7 @@ dist/linux-amd64/udpfile-keygen
 ```bash
 cd dist/linux-amd64
 sha256sum -c SHA256SUMS
-./udpfile-server -help
+./udpfile help
 ```
 
 ## 生成安全配置
@@ -35,7 +29,7 @@ sha256sum -c SHA256SUMS
 首次部署时，在目标服务器运行一次：
 
 ```bash
-./bin/udpfile-keygen
+./bin/udpfile keygen
 ```
 
 该命令不会覆盖已有文件，并生成：
@@ -69,13 +63,13 @@ UDPFILE_RSA_PUBLIC_KEY=keys/server-public.pem
 
 ```bash
 # 目标服务器：只开放 UDP 9000
-./bin/udpfile-server
+./bin/udpfile server
 ```
 
 在本地电脑启动 Web 助手：
 
 ```bash
-./bin/udpfile-web
+./bin/udpfile web
 ```
 
 然后用本地浏览器打开：
@@ -92,7 +86,7 @@ http://127.0.0.1:8080
 tar -xzf 2026.tar.gz
 ```
 
-`udpfile-web` 强制只监听 `127.0.0.1`、`::1` 或 `localhost`，并使用页面令牌与 Host 校验阻止其他网页借本机接口发起下载。
+`udpfile web` 强制只监听 `127.0.0.1`、`::1` 或 `localhost`，并使用页面令牌与 Host 校验阻止其他网页借本机接口发起下载。
 
 ## 命令行客户端下载
 
@@ -100,10 +94,10 @@ tar -xzf 2026.tar.gz
 
 ```bash
 # 目标服务器
-./bin/udpfile-server
+./bin/udpfile server
 
 # 本地客户端
-./bin/udpfile-client \
+./bin/udpfile client \
   -path photos/2026 \
   -out ./received-photos
 ```
@@ -139,7 +133,7 @@ tar -xzf 2026.tar.gz
 ## 常用参数
 
 ```text
-udpfile-server:
+udpfile server:
   -addr          监听地址，默认 127.0.0.1:9000
   -root          共享根目录，默认当前目录
   -max-bytes     单次请求的源文件总大小上限
@@ -147,7 +141,7 @@ udpfile-server:
   -session-ttl   临时归档保留时间
   -temp-dir      临时归档目录
 
-udpfile-client:
+udpfile client:
   -server        服务器地址，默认 127.0.0.1:9000
   -path          服务端根目录下的相对目录（必填）
   -out           本地输出目录（必填，必须不存在）
@@ -155,7 +149,7 @@ udpfile-client:
   -retry         单包重试间隔，默认 300ms
   -max-archive   接受的最大压缩包大小
 
-udpfile-web:
+udpfile web:
   -listen        本地页面地址，默认 127.0.0.1:8080，只允许回环地址
   -server        页面中预填的目标服务器 IP
   -port          页面中预填的目标 UDP 端口，默认 9000
@@ -164,6 +158,11 @@ udpfile-web:
   -max-archive   浏览器下载的最大压缩包大小
   -max-downloads 最大并发浏览器下载数，默认 2
   -temp-dir      下载过程中使用的临时目录
+
+udpfile keygen:
+  -env           环境配置输出路径，默认 .env
+  -keys          RSA 密钥输出目录，默认 keys
+  -rsa-bits      RSA 密钥位数，允许 2048 至 4096，默认 3072
 ```
 
 ## 测试
