@@ -18,8 +18,8 @@ import (
 )
 
 const (
-	defaultRetryInterval = 300 * time.Millisecond
-	defaultMaxArchive    = uint64(11 << 30)
+	DefaultRetryInterval = 300 * time.Millisecond
+	DefaultMaxArchive    = uint64(11 << 30)
 )
 
 type Config struct {
@@ -31,49 +31,24 @@ type Config struct {
 	Logger         *log.Logger
 }
 
+type ArchiveInfo struct {
+	Size   uint64
+	SHA256 [sha256.Size]byte
+}
+
 func Receive(ctx context.Context, config Config) error {
-	if config.ServerAddress == "" || config.RequestedPath == "" || config.Destination == "" {
-		return errors.New("server address, requested path, and destination are required")
+	var err error
+	config, err = normalizeConfig(config)
+	if err != nil {
+		return err
 	}
-	if config.RetryInterval <= 0 {
-		config.RetryInterval = defaultRetryInterval
-	}
-	if config.MaxArchiveSize == 0 {
-		config.MaxArchiveSize = defaultMaxArchive
+	if config.Destination == "" {
+		return errors.New("destination is required")
 	}
 	if _, err := os.Lstat(config.Destination); err == nil {
 		return fmt.Errorf("destination already exists: %s", config.Destination)
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("inspect destination: %w", err)
-	}
-
-	serverAddress, err := net.ResolveUDPAddr("udp", config.ServerAddress)
-	if err != nil {
-		return fmt.Errorf("resolve server address: %w", err)
-	}
-	connection, err := net.DialUDP("udp", nil, serverAddress)
-	if err != nil {
-		return fmt.Errorf("connect to server: %w", err)
-	}
-	defer connection.Close()
-
-	id, err := protocol.NewRequestID()
-	if err != nil {
-		return err
-	}
-	request, err := protocol.EncodeRequest(id, config.RequestedPath)
-	if err != nil {
-		return err
-	}
-	meta, err := awaitMeta(ctx, connection, id, request, config.RetryInterval)
-	if err != nil {
-		return err
-	}
-	if meta.Size > config.MaxArchiveSize {
-		return fmt.Errorf("server archive is %d bytes, exceeding client limit of %d bytes", meta.Size, config.MaxArchiveSize)
-	}
-	if config.Logger != nil {
-		config.Logger.Printf("receiving %d bytes in %d chunks", meta.Size, meta.Chunks)
 	}
 
 	parent := filepath.Dir(config.Destination)
@@ -87,48 +62,16 @@ func Receive(ctx context.Context, config Config) error {
 	temporaryPath := temporary.Name()
 	defer os.Remove(temporaryPath)
 
-	hash := sha256.New()
-	writer := io.MultiWriter(temporary, hash)
-	var received uint64
-	for index := uint32(0); index < meta.Chunks; index++ {
-		data, receiveErr := fetchChunk(ctx, connection, id, index, config.RetryInterval)
-		if receiveErr != nil {
-			temporary.Close()
-			return receiveErr
-		}
-		expectedLength := uint64(meta.ChunkSize)
-		if remaining := meta.Size - received; remaining < expectedLength {
-			expectedLength = remaining
-		}
-		if uint64(len(data)) != expectedLength {
-			temporary.Close()
-			return fmt.Errorf("chunk %d has %d bytes, want %d", index, len(data), expectedLength)
-		}
-		if _, err := writer.Write(data); err != nil {
-			temporary.Close()
-			return fmt.Errorf("write downloaded chunk: %w", err)
-		}
-		received += uint64(len(data))
-	}
-	if received != meta.Size {
-		temporary.Close()
-		return fmt.Errorf("received %d bytes, want %d", received, meta.Size)
+	if _, err := downloadArchive(ctx, config, temporary); err != nil {
+		_ = temporary.Close()
+		return err
 	}
 	if err := temporary.Sync(); err != nil {
-		temporary.Close()
+		_ = temporary.Close()
 		return fmt.Errorf("sync downloaded archive: %w", err)
 	}
 	if err := temporary.Close(); err != nil {
 		return fmt.Errorf("close downloaded archive: %w", err)
-	}
-	if !bytes.Equal(hash.Sum(nil), meta.SHA256[:]) {
-		return errors.New("downloaded archive checksum does not match server metadata")
-	}
-	completionCtx, cancelCompletion := context.WithTimeout(ctx, 3*config.RetryInterval)
-	completionErr := finishSession(completionCtx, connection, id, config.RetryInterval)
-	cancelCompletion()
-	if completionErr != nil && config.Logger != nil {
-		config.Logger.Printf("warning: server will clean this session after its TTL: %v", completionErr)
 	}
 	if err := archivefile.Extract(temporaryPath, config.Destination); err != nil {
 		return fmt.Errorf("extract downloaded directory: %w", err)
@@ -137,6 +80,98 @@ func Receive(ctx context.Context, config Config) error {
 		config.Logger.Printf("restored directory to %s", config.Destination)
 	}
 	return nil
+}
+
+// DownloadArchive receives and verifies a tar.gz archive through the UDP
+// protocol without extracting it. The writer is left open for the caller.
+func DownloadArchive(ctx context.Context, config Config, destination io.Writer) (ArchiveInfo, error) {
+	var err error
+	config, err = normalizeConfig(config)
+	if err != nil {
+		return ArchiveInfo{}, err
+	}
+	if destination == nil {
+		return ArchiveInfo{}, errors.New("archive destination writer is required")
+	}
+	return downloadArchive(ctx, config, destination)
+}
+
+func normalizeConfig(config Config) (Config, error) {
+	if config.ServerAddress == "" || config.RequestedPath == "" {
+		return Config{}, errors.New("server address and requested path are required")
+	}
+	if config.RetryInterval <= 0 {
+		config.RetryInterval = DefaultRetryInterval
+	}
+	if config.MaxArchiveSize == 0 {
+		config.MaxArchiveSize = DefaultMaxArchive
+	}
+	return config, nil
+}
+
+func downloadArchive(ctx context.Context, config Config, destination io.Writer) (ArchiveInfo, error) {
+	serverAddress, err := net.ResolveUDPAddr("udp", config.ServerAddress)
+	if err != nil {
+		return ArchiveInfo{}, fmt.Errorf("resolve server address: %w", err)
+	}
+	connection, err := net.DialUDP("udp", nil, serverAddress)
+	if err != nil {
+		return ArchiveInfo{}, fmt.Errorf("connect to server: %w", err)
+	}
+	defer connection.Close()
+
+	id, err := protocol.NewRequestID()
+	if err != nil {
+		return ArchiveInfo{}, err
+	}
+	request, err := protocol.EncodeRequest(id, config.RequestedPath)
+	if err != nil {
+		return ArchiveInfo{}, err
+	}
+	meta, err := awaitMeta(ctx, connection, id, request, config.RetryInterval)
+	if err != nil {
+		return ArchiveInfo{}, err
+	}
+	if meta.Size > config.MaxArchiveSize {
+		return ArchiveInfo{}, fmt.Errorf("server archive is %d bytes, exceeding client limit of %d bytes", meta.Size, config.MaxArchiveSize)
+	}
+	if config.Logger != nil {
+		config.Logger.Printf("receiving %d bytes in %d chunks", meta.Size, meta.Chunks)
+	}
+
+	hash := sha256.New()
+	writer := io.MultiWriter(destination, hash)
+	var received uint64
+	for index := uint32(0); index < meta.Chunks; index++ {
+		data, receiveErr := fetchChunk(ctx, connection, id, index, config.RetryInterval)
+		if receiveErr != nil {
+			return ArchiveInfo{}, receiveErr
+		}
+		expectedLength := uint64(meta.ChunkSize)
+		if remaining := meta.Size - received; remaining < expectedLength {
+			expectedLength = remaining
+		}
+		if uint64(len(data)) != expectedLength {
+			return ArchiveInfo{}, fmt.Errorf("chunk %d has %d bytes, want %d", index, len(data), expectedLength)
+		}
+		if _, err := writer.Write(data); err != nil {
+			return ArchiveInfo{}, fmt.Errorf("write downloaded chunk: %w", err)
+		}
+		received += uint64(len(data))
+	}
+	if received != meta.Size {
+		return ArchiveInfo{}, fmt.Errorf("received %d bytes, want %d", received, meta.Size)
+	}
+	if !bytes.Equal(hash.Sum(nil), meta.SHA256[:]) {
+		return ArchiveInfo{}, errors.New("downloaded archive checksum does not match server metadata")
+	}
+	completionCtx, cancelCompletion := context.WithTimeout(ctx, 3*config.RetryInterval)
+	completionErr := finishSession(completionCtx, connection, id, config.RetryInterval)
+	cancelCompletion()
+	if completionErr != nil && config.Logger != nil {
+		config.Logger.Printf("warning: server will clean this session after its TTL: %v", completionErr)
+	}
+	return ArchiveInfo{Size: meta.Size, SHA256: meta.SHA256}, nil
 }
 
 func finishSession(ctx context.Context, connection *net.UDPConn, id protocol.RequestID, retryInterval time.Duration) error {

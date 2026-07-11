@@ -23,8 +23,8 @@ func run() error {
 	requestedPath := flag.String("path", "", "服务器共享根目录下的相对文件夹路径")
 	destination := flag.String("out", "", "本地输出目录（必须尚不存在）")
 	timeout := flag.Duration("timeout", 10*time.Minute, "整个传输的超时时间")
-	retry := flag.Duration("retry", 300*time.Millisecond, "未收到数据包时的重试间隔")
-	maxArchive := flag.Uint64("max-archive", 11<<30, "客户端接受的最大压缩归档字节数")
+	retry := flag.Duration("retry", client.DefaultRetryInterval, "未收到数据包时的重试间隔")
+	maxArchive := flag.Uint64("max-archive", client.DefaultMaxArchive, "客户端接受的最大压缩归档字节数")
 	flag.Parse()
 
 	if *requestedPath == "" || *destination == "" {

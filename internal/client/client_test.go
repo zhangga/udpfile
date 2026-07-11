@@ -1,6 +1,7 @@
 package client_test
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"log"
@@ -12,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	archivefile "udpfile/internal/archive"
 	"udpfile/internal/client"
 	"udpfile/internal/protocol"
 	"udpfile/internal/server"
@@ -47,6 +49,39 @@ func TestReceiveRestoresDirectoryOverUDP(t *testing.T) {
 	if stat, err := os.Stat(filepath.Join(destination, "empty")); err != nil || !stat.IsDir() {
 		t.Fatalf("empty directory was not restored: stat=%v err=%v", stat, err)
 	}
+}
+
+func TestDownloadArchiveReturnsBrowserReadyTarGzip(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "shared")
+	mustMkdirAll(t, source)
+	mustWriteFile(t, filepath.Join(source, "browser.txt"), []byte("download me\n"))
+	serverAddress, stopServer := startServer(t, root)
+	defer stopServer()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	var downloaded bytes.Buffer
+	info, err := client.DownloadArchive(ctx, client.Config{
+		ServerAddress:  serverAddress,
+		RequestedPath:  "shared",
+		RetryInterval:  30 * time.Millisecond,
+		MaxArchiveSize: 1 << 20,
+	}, &downloaded)
+	if err != nil {
+		t.Fatalf("DownloadArchive() error = %v", err)
+	}
+	if info.Size != uint64(downloaded.Len()) || info.SHA256 == [32]byte{} {
+		t.Fatalf("DownloadArchive() info = %+v for %d downloaded bytes", info, downloaded.Len())
+	}
+
+	archivePath := filepath.Join(t.TempDir(), "browser.tar.gz")
+	mustWriteFile(t, archivePath, downloaded.Bytes())
+	destination := filepath.Join(t.TempDir(), "received")
+	if err := archivefile.Extract(archivePath, destination); err != nil {
+		t.Fatalf("Extract() error = %v", err)
+	}
+	assertFile(t, filepath.Join(destination, "browser.txt"), []byte("download me\n"))
 }
 
 func TestReceiveReturnsServerPathError(t *testing.T) {
