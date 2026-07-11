@@ -1,7 +1,9 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"crypto/rsa"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +17,7 @@ import (
 
 	archivefile "udpfile/internal/archive"
 	"udpfile/internal/protocol"
+	securetransport "udpfile/internal/secure"
 )
 
 const (
@@ -29,6 +32,8 @@ type Config struct {
 	MaxSourceBytes int64
 	SessionTTL     time.Duration
 	MaxSessions    int
+	SharedSecret   []byte
+	ServerIdentity *rsa.PrivateKey
 	Logger         *log.Logger
 }
 
@@ -42,6 +47,10 @@ type Server struct {
 }
 
 type session struct {
+	security      *securetransport.Session
+	clientHello   []byte
+	serverHello   []byte
+	clientAddress string
 	requestedPath string
 	lastAccess    time.Time
 	preparing     bool
@@ -56,6 +65,12 @@ func New(connection *net.UDPConn, config Config) (*Server, error) {
 	}
 	if config.Root == "" {
 		return nil, errors.New("shared root is required")
+	}
+	if len(config.SharedSecret) != 32 {
+		return nil, errors.New("32-byte shared secret is required")
+	}
+	if config.ServerIdentity == nil || config.ServerIdentity.N.BitLen() < 2048 {
+		return nil, errors.New("RSA server identity of at least 2048 bits is required")
 	}
 	root, err := filepath.Abs(config.Root)
 	if err != nil {
@@ -125,12 +140,10 @@ func (server *Server) Serve(ctx context.Context) error {
 			continue
 		}
 		switch packetType {
-		case protocol.TypeRequest:
-			server.handleRequest(packet, clientAddress)
-		case protocol.TypeGet:
-			server.handleGet(packet, clientAddress)
-		case protocol.TypeDone:
-			server.handleDone(packet, clientAddress)
+		case protocol.TypeClientHello:
+			server.handleClientHello(packet, clientAddress)
+		case protocol.TypeSecure:
+			server.handleSecure(packet, clientAddress)
 		default:
 			server.config.Logger.Printf("ignored unexpected packet type %d from %s", packetType, clientAddress)
 		}
@@ -141,24 +154,18 @@ func (server *Server) Serve(ctx context.Context) error {
 	}
 }
 
-func (server *Server) handleRequest(packet []byte, clientAddress *net.UDPAddr) {
-	id, requestedPath, err := protocol.DecodeRequest(packet)
+func (server *Server) handleClientHello(packet []byte, clientAddress *net.UDPAddr) {
+	_, id, err := protocol.Header(packet)
 	if err != nil {
 		return
 	}
-
+	address := clientAddress.String()
 	server.mu.Lock()
 	if existing, ok := server.sessions[id]; ok {
-		existing.lastAccess = time.Now()
-		if existing.requestedPath != requestedPath {
+		if existing.clientAddress == address && bytes.Equal(existing.clientHello, packet) {
+			response := append([]byte(nil), existing.serverHello...)
 			server.mu.Unlock()
-			server.sendError(id, clientAddress, "request ID was reused with a different path")
-			return
-		}
-		if !existing.preparing {
-			meta := existing.meta
-			server.mu.Unlock()
-			server.sendMeta(id, meta, clientAddress)
+			server.send(response, clientAddress)
 			return
 		}
 		server.mu.Unlock()
@@ -166,12 +173,94 @@ func (server *Server) handleRequest(packet []byte, clientAddress *net.UDPAddr) {
 	}
 	if len(server.sessions) >= server.config.MaxSessions {
 		server.mu.Unlock()
-		server.sendError(id, clientAddress, "server is busy; try again later")
+		return
+	}
+	server.mu.Unlock()
+
+	serverHello, security, err := securetransport.AcceptClientHandshake(packet, server.config.SharedSecret, server.config.ServerIdentity)
+	if err != nil {
 		return
 	}
 	now := time.Now()
-	current := &session{requestedPath: requestedPath, lastAccess: now, preparing: true}
+	current := &session{
+		security:      security,
+		clientHello:   append([]byte(nil), packet...),
+		serverHello:   append([]byte(nil), serverHello...),
+		clientAddress: address,
+		lastAccess:    now,
+	}
+	server.mu.Lock()
+	if _, exists := server.sessions[id]; exists || len(server.sessions) >= server.config.MaxSessions {
+		server.mu.Unlock()
+		return
+	}
 	server.sessions[id] = current
+	server.mu.Unlock()
+	server.send(serverHello, clientAddress)
+}
+
+func (server *Server) handleSecure(packet []byte, clientAddress *net.UDPAddr) {
+	_, id, err := protocol.Header(packet)
+	if err != nil {
+		return
+	}
+	server.mu.Lock()
+	current, ok := server.sessions[id]
+	if !ok || current.clientAddress != clientAddress.String() {
+		server.mu.Unlock()
+		return
+	}
+	innerPacket, err := current.security.Open(packet)
+	if err != nil {
+		server.mu.Unlock()
+		return
+	}
+	current.lastAccess = time.Now()
+	server.mu.Unlock()
+	innerType, _, err := protocol.Header(innerPacket)
+	if err != nil {
+		return
+	}
+	switch innerType {
+	case protocol.TypeRequest:
+		server.handleRequest(innerPacket, clientAddress)
+	case protocol.TypeGet:
+		server.handleGet(innerPacket, clientAddress)
+	case protocol.TypeDone:
+		server.handleDone(innerPacket, clientAddress)
+	}
+}
+
+func (server *Server) handleRequest(packet []byte, clientAddress *net.UDPAddr) {
+	id, requestedPath, err := protocol.DecodeRequest(packet)
+	if err != nil {
+		return
+	}
+
+	server.mu.Lock()
+	current, ok := server.sessions[id]
+	if !ok || current.clientAddress != clientAddress.String() {
+		server.mu.Unlock()
+		return
+	}
+	current.lastAccess = time.Now()
+	if current.requestedPath != "" {
+		if current.requestedPath != requestedPath {
+			server.mu.Unlock()
+			server.sendError(current, id, clientAddress, "request ID was reused with a different path")
+			return
+		}
+		if !current.preparing && current.file != nil {
+			meta := current.meta
+			server.mu.Unlock()
+			server.sendMeta(current, id, meta, clientAddress)
+			return
+		}
+		server.mu.Unlock()
+		return
+	}
+	current.requestedPath = requestedPath
+	current.preparing = true
 	server.mu.Unlock()
 
 	server.config.Logger.Printf("preparing %q for %s", requestedPath, clientAddress)
@@ -229,7 +318,7 @@ func (server *Server) prepare(id protocol.RequestID, current *session, clientAdd
 	server.mu.Unlock()
 
 	server.config.Logger.Printf("ready %q: %d bytes in %d chunks", current.requestedPath, meta.Size, meta.Chunks)
-	server.sendMeta(id, meta, clientAddress)
+	server.sendMeta(current, id, meta, clientAddress)
 }
 
 func (server *Server) failPreparation(id protocol.RequestID, current *session, clientAddress *net.UDPAddr, err error) {
@@ -239,7 +328,7 @@ func (server *Server) failPreparation(id protocol.RequestID, current *session, c
 	}
 	server.mu.Unlock()
 	server.config.Logger.Printf("cannot prepare %q: %v", current.requestedPath, err)
-	server.sendError(id, clientAddress, fmt.Sprintf("cannot send %q: %v", current.requestedPath, err))
+	server.sendError(current, id, clientAddress, fmt.Sprintf("cannot send %q: %v", current.requestedPath, err))
 }
 
 func (server *Server) handleGet(packet []byte, clientAddress *net.UDPAddr) {
@@ -263,14 +352,14 @@ func (server *Server) handleGet(packet []byte, clientAddress *net.UDPAddr) {
 	read, readErr := current.file.ReadAt(data, offset)
 	server.mu.Unlock()
 	if readErr != nil && !errors.Is(readErr, io.EOF) || read != len(data) {
-		server.sendError(id, clientAddress, "could not read prepared archive")
+		server.sendError(current, id, clientAddress, "could not read prepared archive")
 		return
 	}
 	response, err := protocol.EncodeData(id, index, data)
 	if err != nil {
 		return
 	}
-	server.send(response, clientAddress)
+	server.sendEncrypted(current, response, clientAddress)
 }
 
 func (server *Server) handleDone(packet []byte, clientAddress *net.UDPAddr) {
@@ -279,29 +368,38 @@ func (server *Server) handleDone(packet []byte, clientAddress *net.UDPAddr) {
 		return
 	}
 	server.mu.Lock()
-	if current, ok := server.sessions[id]; ok {
+	if current, ok := server.sessions[id]; ok && current.clientAddress == clientAddress.String() {
+		acknowledgement, encodeErr := protocol.EncodeDone(id)
+		if encodeErr == nil {
+			server.sendEncrypted(current, acknowledgement, clientAddress)
+		}
 		server.closeSession(current)
 		delete(server.sessions, id)
 	}
 	server.mu.Unlock()
-	acknowledgement, err := protocol.EncodeDone(id)
-	if err == nil {
-		server.send(acknowledgement, clientAddress)
-	}
 }
 
-func (server *Server) sendMeta(id protocol.RequestID, meta protocol.Meta, address *net.UDPAddr) {
+func (server *Server) sendMeta(current *session, id protocol.RequestID, meta protocol.Meta, address *net.UDPAddr) {
 	packet, err := protocol.EncodeMeta(id, meta)
 	if err == nil {
-		server.send(packet, address)
+		server.sendEncrypted(current, packet, address)
 	}
 }
 
-func (server *Server) sendError(id protocol.RequestID, address *net.UDPAddr, message string) {
+func (server *Server) sendError(current *session, id protocol.RequestID, address *net.UDPAddr, message string) {
 	packet, err := protocol.EncodeError(id, message)
 	if err == nil {
-		server.send(packet, address)
+		server.sendEncrypted(current, packet, address)
 	}
+}
+
+func (server *Server) sendEncrypted(current *session, innerPacket []byte, address *net.UDPAddr) {
+	packet, err := current.security.Seal(innerPacket)
+	if err != nil {
+		server.config.Logger.Printf("encrypt packet for %s: %v", address, err)
+		return
+	}
+	server.send(packet, address)
 }
 
 func (server *Server) send(packet []byte, address *net.UDPAddr) {

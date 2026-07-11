@@ -107,7 +107,7 @@
 
     .protocol {
       display: grid;
-      grid-template-columns: repeat(3, 1fr);
+      grid-template-columns: repeat(4, 1fr);
       gap: 1px;
       margin-top: 44px;
       border: 1px solid var(--line);
@@ -218,17 +218,18 @@
     <header>
       <div class="brand"><i class="brand-mark" aria-hidden="true"></i><span>UDP 文件接收站</span></div>
       <span class="status">本机桥接已就绪</span>
-      <span>RAW UDP / V1</span>
+      <span>ENCRYPTED UDP / V2</span>
     </header>
 
     <main>
       <section aria-labelledby="hero-title">
         <p class="eyebrow">Point-to-point directory retrieval</p>
         <h1 id="hero-title">把远端目录<br><em>拽回本机。</em></h1>
-        <p class="intro">浏览器只连接本机助手。跨电脑的目录请求、分片、校验与重传全部通过 UDP 完成，目标服务器无需开放任何 TCP 或 HTTP 端口。</p>
+        <p class="intro">浏览器只连接本机助手。跨电脑的目录请求、分片、校验与重传全部通过强制加密的 UDP v2 协议完成，目标服务器无需开放任何 TCP 或 HTTP 端口。</p>
         <div class="protocol" aria-label="协议特性">
-          <div><b>1200 B</b><span>安全分片</span></div>
-          <div><b>SHA-256</b><span>完整校验</span></div>
+          <div><b>1120 B</b><span>加密分片</span></div>
+          <div><b>AES-GCM</b><span>逐包认证</span></div>
+          <div><b>X25519</b><span>临时会话</span></div>
           <div><b>RETRY</b><span>逐块重传</span></div>
         </div>
       </section>

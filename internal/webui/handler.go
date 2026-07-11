@@ -3,6 +3,7 @@ package webui
 import (
 	"context"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/subtle"
 	_ "embed"
 	"encoding/base64"
@@ -40,20 +41,24 @@ type Config struct {
 	RetryInterval   time.Duration
 	MaxArchiveSize  uint64
 	MaxConcurrent   int
+	SharedSecret    []byte
+	ServerIdentity  *rsa.PublicKey
 	Logger          *log.Logger
 }
 
 type Handler struct {
-	page          *template.Template
-	csrfToken     string
-	defaultServer string
-	defaultPort   int
-	tempDir       string
-	timeout       time.Duration
-	retryInterval time.Duration
-	maxArchive    uint64
-	downloadSlots chan struct{}
-	logger        *log.Logger
+	page           *template.Template
+	csrfToken      string
+	defaultServer  string
+	defaultPort    int
+	tempDir        string
+	timeout        time.Duration
+	retryInterval  time.Duration
+	maxArchive     uint64
+	sharedSecret   []byte
+	serverIdentity *rsa.PublicKey
+	downloadSlots  chan struct{}
+	logger         *log.Logger
 }
 
 type pageData struct {
@@ -68,6 +73,12 @@ func NewHandler(config Config) (http.Handler, error) {
 	}
 	if config.DefaultPort < 1 || config.DefaultPort > 65535 {
 		return nil, errors.New("default UDP port must be between 1 and 65535")
+	}
+	if len(config.SharedSecret) != 32 {
+		return nil, errors.New("32-byte shared secret is required")
+	}
+	if config.ServerIdentity == nil || config.ServerIdentity.N.BitLen() < 2048 {
+		return nil, errors.New("RSA server identity of at least 2048 bits is required")
 	}
 	if config.Logger == nil {
 		config.Logger = log.New(io.Discard, "", 0)
@@ -99,16 +110,18 @@ func NewHandler(config Config) (http.Handler, error) {
 		return nil, err
 	}
 	return &Handler{
-		page:          page,
-		csrfToken:     base64.RawURLEncoding.EncodeToString(tokenBytes),
-		defaultServer: config.DefaultServer,
-		defaultPort:   config.DefaultPort,
-		tempDir:       config.TempDir,
-		timeout:       config.TransferTimeout,
-		retryInterval: config.RetryInterval,
-		maxArchive:    config.MaxArchiveSize,
-		downloadSlots: make(chan struct{}, config.MaxConcurrent),
-		logger:        config.Logger,
+		page:           page,
+		csrfToken:      base64.RawURLEncoding.EncodeToString(tokenBytes),
+		defaultServer:  config.DefaultServer,
+		defaultPort:    config.DefaultPort,
+		tempDir:        config.TempDir,
+		timeout:        config.TransferTimeout,
+		retryInterval:  config.RetryInterval,
+		maxArchive:     config.MaxArchiveSize,
+		sharedSecret:   append([]byte(nil), config.SharedSecret...),
+		serverIdentity: config.ServerIdentity,
+		downloadSlots:  make(chan struct{}, config.MaxConcurrent),
+		logger:         config.Logger,
 	}, nil
 }
 
@@ -188,6 +201,8 @@ func (handler *Handler) serveDownload(response http.ResponseWriter, request *htt
 		RequestedPath:  requestedPath,
 		RetryInterval:  handler.retryInterval,
 		MaxArchiveSize: handler.maxArchive,
+		SharedSecret:   handler.sharedSecret,
+		ServerIdentity: handler.serverIdentity,
 		Logger:         handler.logger,
 	}, temporary)
 	cancel()

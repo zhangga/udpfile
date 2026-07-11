@@ -9,19 +9,23 @@ import (
 )
 
 const (
-	Version         = byte(1)
+	Version         = byte(2)
 	MaxDatagramSize = 1232
-	ChunkSize       = 1200
-	headerSize      = 22
+	ChunkSize       = 1120
+	HeaderSize      = 22
+	MaxInnerSize    = MaxDatagramSize - HeaderSize - 8 - 16
 	maxRequestPath  = 1024
 )
 
-var magic = [4]byte{'U', 'D', 'F', '1'}
+var magic = [4]byte{'U', 'D', 'F', '2'}
 
 type Type byte
 
 const (
-	TypeRequest Type = iota + 1
+	TypeClientHello Type = iota + 1
+	TypeServerHello
+	TypeSecure
+	TypeRequest
 	TypeMeta
 	TypeGet
 	TypeData
@@ -49,6 +53,88 @@ func NewRequestID() (RequestID, error) {
 func Header(datagram []byte) (Type, RequestID, error) {
 	packetType, id, _, err := decode(datagram)
 	return packetType, id, err
+}
+
+func EncodeClientHello(id RequestID, publicKey, nonce, authentication []byte) ([]byte, error) {
+	if len(publicKey) != 32 || len(nonce) != 32 || len(authentication) != 32 {
+		return nil, errors.New("invalid client hello field length")
+	}
+	payload := make([]byte, 96)
+	copy(payload[0:32], publicKey)
+	copy(payload[32:64], nonce)
+	copy(payload[64:96], authentication)
+	return encode(TypeClientHello, id, payload)
+}
+
+func DecodeClientHello(datagram []byte) (RequestID, [32]byte, [32]byte, [32]byte, error) {
+	id, payload, err := decodeType(datagram, TypeClientHello)
+	if err != nil {
+		return RequestID{}, [32]byte{}, [32]byte{}, [32]byte{}, err
+	}
+	if len(payload) != 96 {
+		return RequestID{}, [32]byte{}, [32]byte{}, [32]byte{}, errors.New("invalid client hello length")
+	}
+	var publicKey, nonce, authentication [32]byte
+	copy(publicKey[:], payload[0:32])
+	copy(nonce[:], payload[32:64])
+	copy(authentication[:], payload[64:96])
+	return id, publicKey, nonce, authentication, nil
+}
+
+func EncodeServerHello(id RequestID, publicKey, nonce, signature []byte) ([]byte, error) {
+	if len(publicKey) != 32 || len(nonce) != 32 || len(signature) == 0 || len(signature) > 512 {
+		return nil, errors.New("invalid server hello field length")
+	}
+	payload := make([]byte, 66+len(signature))
+	copy(payload[0:32], publicKey)
+	copy(payload[32:64], nonce)
+	binary.BigEndian.PutUint16(payload[64:66], uint16(len(signature)))
+	copy(payload[66:], signature)
+	return encode(TypeServerHello, id, payload)
+}
+
+func DecodeServerHello(datagram []byte) (RequestID, [32]byte, [32]byte, []byte, error) {
+	id, payload, err := decodeType(datagram, TypeServerHello)
+	if err != nil {
+		return RequestID{}, [32]byte{}, [32]byte{}, nil, err
+	}
+	if len(payload) < 67 {
+		return RequestID{}, [32]byte{}, [32]byte{}, nil, errors.New("invalid server hello length")
+	}
+	signatureLength := int(binary.BigEndian.Uint16(payload[64:66]))
+	if signatureLength == 0 || signatureLength > 512 || len(payload) != 66+signatureLength {
+		return RequestID{}, [32]byte{}, [32]byte{}, nil, errors.New("invalid server hello signature length")
+	}
+	var publicKey, nonce [32]byte
+	copy(publicKey[:], payload[0:32])
+	copy(nonce[:], payload[32:64])
+	return id, publicKey, nonce, append([]byte(nil), payload[66:]...), nil
+}
+
+func EncodeSecure(id RequestID, encryptedPayload []byte) ([]byte, error) {
+	if len(encryptedPayload) < 8+16 {
+		return nil, errors.New("encrypted payload is too short")
+	}
+	return encode(TypeSecure, id, encryptedPayload)
+}
+
+func DecodeSecure(datagram []byte) (RequestID, []byte, error) {
+	id, payload, err := decodeType(datagram, TypeSecure)
+	if err != nil {
+		return RequestID{}, nil, err
+	}
+	if len(payload) < 8+16 {
+		return RequestID{}, nil, errors.New("encrypted payload is too short")
+	}
+	return id, payload, nil
+}
+
+func SecureAssociatedData(id RequestID, sequence uint64) []byte {
+	header, _ := encode(TypeSecure, id, nil)
+	associatedData := make([]byte, HeaderSize+8)
+	copy(associatedData, header)
+	binary.BigEndian.PutUint64(associatedData[HeaderSize:], sequence)
+	return associatedData
 }
 
 func EncodeRequest(id RequestID, requestedPath string) ([]byte, error) {
@@ -154,7 +240,7 @@ func EncodeError(id RequestID, message string) ([]byte, error) {
 	if message == "" {
 		message = "unknown server error"
 	}
-	maxLength := MaxDatagramSize - headerSize
+	maxLength := MaxInnerSize - HeaderSize
 	if len(message) > maxLength {
 		message = message[:maxLength]
 	}
@@ -185,10 +271,10 @@ func DecodeDone(datagram []byte) (RequestID, error) {
 }
 
 func encode(packetType Type, id RequestID, payload []byte) ([]byte, error) {
-	if headerSize+len(payload) > MaxDatagramSize {
+	if HeaderSize+len(payload) > MaxDatagramSize {
 		return nil, fmt.Errorf("datagram exceeds %d bytes", MaxDatagramSize)
 	}
-	datagram := make([]byte, headerSize+len(payload))
+	datagram := make([]byte, HeaderSize+len(payload))
 	copy(datagram[0:4], magic[:])
 	datagram[4] = Version
 	datagram[5] = byte(packetType)
@@ -209,14 +295,14 @@ func decodeType(datagram []byte, want Type) (RequestID, []byte, error) {
 }
 
 func decode(datagram []byte) (Type, RequestID, []byte, error) {
-	if len(datagram) < headerSize || len(datagram) > MaxDatagramSize {
+	if len(datagram) < HeaderSize || len(datagram) > MaxDatagramSize {
 		return 0, RequestID{}, nil, errors.New("invalid datagram length")
 	}
 	if string(datagram[0:4]) != string(magic[:]) || datagram[4] != Version {
 		return 0, RequestID{}, nil, errors.New("invalid protocol header")
 	}
 	packetType := Type(datagram[5])
-	if packetType < TypeRequest || packetType > TypeDone {
+	if packetType < TypeClientHello || packetType > TypeDone {
 		return 0, RequestID{}, nil, errors.New("unknown packet type")
 	}
 	var id RequestID

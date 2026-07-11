@@ -1,4 +1,6 @@
 /bin/
+/keys/
+.env
 *.tmp
 *.tar.gz
 .DS_Store

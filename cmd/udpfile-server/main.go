@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"udpfile/internal/appconfig"
 	"udpfile/internal/server"
 )
 
@@ -22,13 +23,20 @@ func main() {
 }
 
 func run() error {
-	address := flag.String("addr", "127.0.0.1:9000", "UDP 监听地址")
-	root := flag.String("root", ".", "允许客户端读取的根目录")
+	if err := appconfig.LoadDefault(); err != nil {
+		return fmt.Errorf("加载 .env：%w", err)
+	}
+	address := flag.String("addr", appconfig.String("UDPFILE_SERVER_ADDR", "127.0.0.1:9000"), "UDP 监听地址")
+	root := flag.String("root", appconfig.String("UDPFILE_ROOT", "."), "允许客户端读取的根目录")
 	maxBytes := flag.Int64("max-bytes", 10<<30, "单次请求允许读取的源文件总字节数")
 	maxSessions := flag.Int("max-sessions", 32, "最大并发传输会话数")
 	sessionTTL := flag.Duration("session-ttl", 5*time.Minute, "完成传输后服务端保留临时归档的时间")
 	tempDir := flag.String("temp-dir", "", "临时归档目录（默认使用系统临时目录）")
 	flag.Parse()
+	sharedSecret, serverIdentity, err := appconfig.LoadServerCredentials()
+	if err != nil {
+		return err
+	}
 
 	udpAddress, err := net.ResolveUDPAddr("udp", *address)
 	if err != nil {
@@ -47,6 +55,8 @@ func run() error {
 		MaxSourceBytes: *maxBytes,
 		SessionTTL:     *sessionTTL,
 		MaxSessions:    *maxSessions,
+		SharedSecret:   sharedSecret,
+		ServerIdentity: serverIdentity,
 		Logger:         logger,
 	})
 	if err != nil {

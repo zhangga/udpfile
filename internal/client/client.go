@@ -3,6 +3,7 @@ package client
 import (
 	"bytes"
 	"context"
+	"crypto/rsa"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 
 	archivefile "udpfile/internal/archive"
 	"udpfile/internal/protocol"
+	securetransport "udpfile/internal/secure"
 )
 
 const (
@@ -28,6 +30,8 @@ type Config struct {
 	Destination    string
 	RetryInterval  time.Duration
 	MaxArchiveSize uint64
+	SharedSecret   []byte
+	ServerIdentity *rsa.PublicKey
 	Logger         *log.Logger
 }
 
@@ -100,6 +104,12 @@ func normalizeConfig(config Config) (Config, error) {
 	if config.ServerAddress == "" || config.RequestedPath == "" {
 		return Config{}, errors.New("server address and requested path are required")
 	}
+	if len(config.SharedSecret) != 32 {
+		return Config{}, errors.New("32-byte shared secret is required")
+	}
+	if config.ServerIdentity == nil || config.ServerIdentity.N.BitLen() < 2048 {
+		return Config{}, errors.New("RSA server identity of at least 2048 bits is required")
+	}
 	if config.RetryInterval <= 0 {
 		config.RetryInterval = DefaultRetryInterval
 	}
@@ -124,11 +134,19 @@ func downloadArchive(ctx context.Context, config Config, destination io.Writer) 
 	if err != nil {
 		return ArchiveInfo{}, err
 	}
-	request, err := protocol.EncodeRequest(id, config.RequestedPath)
+	handshake, clientHello, err := securetransport.NewClientHandshake(id, config.SharedSecret)
 	if err != nil {
 		return ArchiveInfo{}, err
 	}
-	meta, err := awaitMeta(ctx, connection, id, request, config.RetryInterval)
+	secureSession, err := awaitServerHandshake(ctx, connection, id, clientHello, handshake, config.ServerIdentity, config.RetryInterval)
+	if err != nil {
+		return ArchiveInfo{}, err
+	}
+	innerRequest, err := protocol.EncodeRequest(id, config.RequestedPath)
+	if err != nil {
+		return ArchiveInfo{}, err
+	}
+	meta, err := awaitMeta(ctx, connection, secureSession, id, innerRequest, config.RetryInterval)
 	if err != nil {
 		return ArchiveInfo{}, err
 	}
@@ -143,7 +161,7 @@ func downloadArchive(ctx context.Context, config Config, destination io.Writer) 
 	writer := io.MultiWriter(destination, hash)
 	var received uint64
 	for index := uint32(0); index < meta.Chunks; index++ {
-		data, receiveErr := fetchChunk(ctx, connection, id, index, config.RetryInterval)
+		data, receiveErr := fetchChunk(ctx, connection, secureSession, id, index, config.RetryInterval)
 		if receiveErr != nil {
 			return ArchiveInfo{}, receiveErr
 		}
@@ -166,7 +184,7 @@ func downloadArchive(ctx context.Context, config Config, destination io.Writer) 
 		return ArchiveInfo{}, errors.New("downloaded archive checksum does not match server metadata")
 	}
 	completionCtx, cancelCompletion := context.WithTimeout(ctx, 3*config.RetryInterval)
-	completionErr := finishSession(completionCtx, connection, id, config.RetryInterval)
+	completionErr := finishSession(completionCtx, connection, secureSession, id, config.RetryInterval)
 	cancelCompletion()
 	if completionErr != nil && config.Logger != nil {
 		config.Logger.Printf("warning: server will clean this session after its TTL: %v", completionErr)
@@ -174,12 +192,45 @@ func downloadArchive(ctx context.Context, config Config, destination io.Writer) 
 	return ArchiveInfo{Size: meta.Size, SHA256: meta.SHA256}, nil
 }
 
-func finishSession(ctx context.Context, connection *net.UDPConn, id protocol.RequestID, retryInterval time.Duration) error {
-	request, err := protocol.EncodeDone(id)
+func awaitServerHandshake(
+	ctx context.Context,
+	connection *net.UDPConn,
+	id protocol.RequestID,
+	clientHello []byte,
+	handshake *securetransport.ClientHandshake,
+	identity *rsa.PublicKey,
+	retryInterval time.Duration,
+) (*securetransport.Session, error) {
+	for {
+		if err := contextError(ctx); err != nil {
+			return nil, err
+		}
+		if _, err := connection.Write(clientHello); err != nil {
+			return nil, fmt.Errorf("send secure handshake: %w", err)
+		}
+		deadline := attemptDeadline(ctx, retryInterval)
+		for {
+			packet, packetType, readErr := readPacket(connection, id, deadline)
+			if isTimeout(readErr) {
+				break
+			}
+			if readErr != nil {
+				return nil, readErr
+			}
+			if packetType != protocol.TypeServerHello {
+				continue
+			}
+			return handshake.Complete(packet, identity)
+		}
+	}
+}
+
+func finishSession(ctx context.Context, connection *net.UDPConn, secureSession *securetransport.Session, id protocol.RequestID, retryInterval time.Duration) error {
+	innerRequest, err := protocol.EncodeDone(id)
 	if err != nil {
 		return err
 	}
-	return exchangeWithRetry(ctx, connection, id, request, retryInterval, func(packet []byte, packetType protocol.Type) (bool, error) {
+	return exchangeWithRetry(ctx, connection, secureSession, id, innerRequest, retryInterval, func(packet []byte, packetType protocol.Type) (bool, error) {
 		if packetType != protocol.TypeDone {
 			return false, nil
 		}
@@ -188,9 +239,9 @@ func finishSession(ctx context.Context, connection *net.UDPConn, id protocol.Req
 	})
 }
 
-func awaitMeta(ctx context.Context, connection *net.UDPConn, id protocol.RequestID, request []byte, retryInterval time.Duration) (protocol.Meta, error) {
+func awaitMeta(ctx context.Context, connection *net.UDPConn, secureSession *securetransport.Session, id protocol.RequestID, innerRequest []byte, retryInterval time.Duration) (protocol.Meta, error) {
 	var meta protocol.Meta
-	err := exchangeWithRetry(ctx, connection, id, request, retryInterval, func(packet []byte, packetType protocol.Type) (bool, error) {
+	err := exchangeWithRetry(ctx, connection, secureSession, id, innerRequest, retryInterval, func(packet []byte, packetType protocol.Type) (bool, error) {
 		if packetType != protocol.TypeMeta {
 			return false, nil
 		}
@@ -203,13 +254,13 @@ func awaitMeta(ctx context.Context, connection *net.UDPConn, id protocol.Request
 	return meta, err
 }
 
-func fetchChunk(ctx context.Context, connection *net.UDPConn, id protocol.RequestID, index uint32, retryInterval time.Duration) ([]byte, error) {
-	request, err := protocol.EncodeGet(id, index)
+func fetchChunk(ctx context.Context, connection *net.UDPConn, secureSession *securetransport.Session, id protocol.RequestID, index uint32, retryInterval time.Duration) ([]byte, error) {
+	innerRequest, err := protocol.EncodeGet(id, index)
 	if err != nil {
 		return nil, err
 	}
 	var result []byte
-	err = exchangeWithRetry(ctx, connection, id, request, retryInterval, func(packet []byte, packetType protocol.Type) (bool, error) {
+	err = exchangeWithRetry(ctx, connection, secureSession, id, innerRequest, retryInterval, func(packet []byte, packetType protocol.Type) (bool, error) {
 		if packetType != protocol.TypeData {
 			return false, nil
 		}
@@ -226,8 +277,9 @@ func fetchChunk(ctx context.Context, connection *net.UDPConn, id protocol.Reques
 func exchangeWithRetry(
 	ctx context.Context,
 	connection *net.UDPConn,
+	secureSession *securetransport.Session,
 	id protocol.RequestID,
-	request []byte,
+	innerRequest []byte,
 	retryInterval time.Duration,
 	handle func([]byte, protocol.Type) (bool, error),
 ) error {
@@ -235,17 +287,32 @@ func exchangeWithRetry(
 		if err := contextError(ctx); err != nil {
 			return err
 		}
+		request, err := secureSession.Seal(innerRequest)
+		if err != nil {
+			return err
+		}
 		if _, err := connection.Write(request); err != nil {
 			return fmt.Errorf("send UDP request: %w", err)
 		}
 		deadline := attemptDeadline(ctx, retryInterval)
 		for {
-			packet, packetType, readErr := readPacket(connection, id, deadline)
+			encryptedPacket, outerType, readErr := readPacket(connection, id, deadline)
 			if isTimeout(readErr) {
 				break
 			}
 			if readErr != nil {
 				return readErr
+			}
+			if outerType != protocol.TypeSecure {
+				continue
+			}
+			packet, decryptErr := secureSession.Open(encryptedPacket)
+			if decryptErr != nil {
+				continue
+			}
+			packetType, _, headerErr := protocol.Header(packet)
+			if headerErr != nil {
+				continue
 			}
 			if packetType == protocol.TypeError {
 				_, message, decodeErr := protocol.DecodeError(packet)

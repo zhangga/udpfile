@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"udpfile/internal/appconfig"
 	"udpfile/internal/webui"
 )
 
@@ -25,15 +26,26 @@ func main() {
 }
 
 func run() error {
-	listenAddress := flag.String("listen", "127.0.0.1:8080", "本地 Web 监听地址（仅允许回环地址）")
-	defaultServer := flag.String("server", "", "页面中预填的目标 UDP 服务器 IP")
-	defaultPort := flag.Int("port", 9000, "页面中预填的目标 UDP 端口")
+	if err := appconfig.LoadDefault(); err != nil {
+		return fmt.Errorf("加载 .env：%w", err)
+	}
+	environmentPort, err := appconfig.Int("UDPFILE_TARGET_PORT", 9000)
+	if err != nil {
+		return err
+	}
+	listenAddress := flag.String("listen", appconfig.String("UDPFILE_WEB_LISTEN", "127.0.0.1:8080"), "本地 Web 监听地址（仅允许回环地址）")
+	defaultServer := flag.String("server", appconfig.String("UDPFILE_TARGET_IP", ""), "页面中预填的目标 UDP 服务器 IP")
+	defaultPort := flag.Int("port", environmentPort, "页面中预填的目标 UDP 端口")
 	transferTimeout := flag.Duration("timeout", 10*time.Minute, "单次 UDP 下载的超时时间")
 	retryInterval := flag.Duration("retry", webui.DefaultRetryInterval, "UDP 数据包重试间隔")
 	maxArchive := flag.Uint64("max-archive", webui.DefaultMaxArchive, "允许下载的最大压缩包字节数")
 	maxDownloads := flag.Int("max-downloads", 2, "最大并发浏览器下载数")
 	tempDir := flag.String("temp-dir", "", "临时下载目录（默认使用系统临时目录）")
 	flag.Parse()
+	sharedSecret, serverIdentity, err := appconfig.LoadClientCredentials()
+	if err != nil {
+		return err
+	}
 
 	resolvedListenAddress, err := resolveLoopbackListenAddress(*listenAddress)
 	if err != nil {
@@ -48,6 +60,8 @@ func run() error {
 		RetryInterval:   *retryInterval,
 		MaxArchiveSize:  *maxArchive,
 		MaxConcurrent:   *maxDownloads,
+		SharedSecret:    sharedSecret,
+		ServerIdentity:  serverIdentity,
 		Logger:          logger,
 	})
 	if err != nil {

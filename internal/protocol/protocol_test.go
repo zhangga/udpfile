@@ -22,7 +22,7 @@ func TestRequestRoundTrip(t *testing.T) {
 
 func TestMetaAndDataRoundTrip(t *testing.T) {
 	id := RequestID{9, 8, 7}
-	wantMeta := Meta{Size: 3210, Chunks: 3, ChunkSize: 1200, SHA256: [32]byte{1, 3, 5, 7}}
+	wantMeta := Meta{Size: 3210, Chunks: 3, ChunkSize: 1120, SHA256: [32]byte{1, 3, 5, 7}}
 	metaPacket, err := EncodeMeta(id, wantMeta)
 	if err != nil {
 		t.Fatalf("EncodeMeta() error = %v", err)

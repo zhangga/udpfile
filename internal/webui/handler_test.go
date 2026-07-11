@@ -1,7 +1,10 @@
 package webui_test
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
 	"io"
 	"log"
 	"net"
@@ -13,12 +16,20 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	archivefile "udpfile/internal/archive"
 	"udpfile/internal/server"
 	"udpfile/internal/webui"
+)
+
+var (
+	webTestSecret       = bytes.Repeat([]byte{0x73}, 32)
+	webTestIdentityOnce sync.Once
+	webTestIdentity     *rsa.PrivateKey
+	webTestIdentityErr  error
 )
 
 func TestHomePageCollectsUDPServerAndDirectory(t *testing.T) {
@@ -56,8 +67,10 @@ func TestDownloadBridgesBrowserRequestToUDPArchive(t *testing.T) {
 	defer stopServer()
 
 	handler, err := webui.NewHandler(webui.Config{
-		DefaultPort: udpAddress.Port,
-		Logger:      log.New(io.Discard, "", 0),
+		DefaultPort:    udpAddress.Port,
+		SharedSecret:   webTestSecret,
+		ServerIdentity: &webRSAIdentity(t).PublicKey,
+		Logger:         log.New(io.Discard, "", 0),
 	})
 	if err != nil {
 		t.Fatalf("NewHandler() error = %v", err)
@@ -135,8 +148,10 @@ func TestDownloadRejectsHostnameInsteadOfExplicitIP(t *testing.T) {
 func newHandler(t *testing.T) http.Handler {
 	t.Helper()
 	handler, err := webui.NewHandler(webui.Config{
-		DefaultPort: 9000,
-		Logger:      log.New(io.Discard, "", 0),
+		DefaultPort:    9000,
+		SharedSecret:   webTestSecret,
+		ServerIdentity: &webRSAIdentity(t).PublicKey,
+		Logger:         log.New(io.Discard, "", 0),
 	})
 	if err != nil {
 		t.Fatalf("NewHandler() error = %v", err)
@@ -168,6 +183,8 @@ func startUDPServer(t *testing.T, root string) (*net.UDPAddr, func()) {
 		MaxSourceBytes: 1 << 20,
 		SessionTTL:     time.Minute,
 		MaxSessions:    4,
+		SharedSecret:   webTestSecret,
+		ServerIdentity: webRSAIdentity(t),
 		Logger:         log.New(io.Discard, "", 0),
 	})
 	if err != nil {
@@ -188,6 +205,17 @@ func startUDPServer(t *testing.T, root string) (*net.UDPAddr, func()) {
 			t.Error("UDP server did not stop")
 		}
 	}
+}
+
+func webRSAIdentity(t *testing.T) *rsa.PrivateKey {
+	t.Helper()
+	webTestIdentityOnce.Do(func() {
+		webTestIdentity, webTestIdentityErr = rsa.GenerateKey(rand.Reader, 2048)
+	})
+	if webTestIdentityErr != nil {
+		t.Fatalf("generate test RSA identity: %v", webTestIdentityErr)
+	}
+	return webTestIdentity
 }
 
 func mustMkdirAll(t *testing.T, path string) {

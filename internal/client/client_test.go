@@ -3,6 +3,8 @@ package client_test
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
 	"io"
 	"log"
 	"net"
@@ -19,6 +21,13 @@ import (
 	"udpfile/internal/server"
 )
 
+var (
+	testSharedSecret = bytes.Repeat([]byte{0x42}, 32)
+	testIdentityOnce sync.Once
+	testIdentity     *rsa.PrivateKey
+	testIdentityErr  error
+)
+
 func TestReceiveRestoresDirectoryOverUDP(t *testing.T) {
 	root := t.TempDir()
 	source := filepath.Join(root, "shared")
@@ -33,13 +42,13 @@ func TestReceiveRestoresDirectoryOverUDP(t *testing.T) {
 	destination := filepath.Join(t.TempDir(), "received")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	err := client.Receive(ctx, client.Config{
+	err := client.Receive(ctx, secureClientConfig(t, client.Config{
 		ServerAddress:  serverAddress,
 		RequestedPath:  "shared",
 		Destination:    destination,
 		RetryInterval:  30 * time.Millisecond,
 		MaxArchiveSize: 10 << 20,
-	})
+	}))
 	if err != nil {
 		t.Fatalf("Receive() error = %v", err)
 	}
@@ -62,12 +71,12 @@ func TestDownloadArchiveReturnsBrowserReadyTarGzip(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	var downloaded bytes.Buffer
-	info, err := client.DownloadArchive(ctx, client.Config{
+	info, err := client.DownloadArchive(ctx, secureClientConfig(t, client.Config{
 		ServerAddress:  serverAddress,
 		RequestedPath:  "shared",
 		RetryInterval:  30 * time.Millisecond,
 		MaxArchiveSize: 1 << 20,
-	}, &downloaded)
+	}), &downloaded)
 	if err != nil {
 		t.Fatalf("DownloadArchive() error = %v", err)
 	}
@@ -91,15 +100,68 @@ func TestReceiveReturnsServerPathError(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	err := client.Receive(ctx, client.Config{
+	err := client.Receive(ctx, secureClientConfig(t, client.Config{
 		ServerAddress:  serverAddress,
 		RequestedPath:  "missing",
 		Destination:    filepath.Join(t.TempDir(), "received"),
 		RetryInterval:  30 * time.Millisecond,
 		MaxArchiveSize: 1 << 20,
-	})
+	}))
 	if err == nil || !strings.Contains(err.Error(), "missing") {
 		t.Fatalf("Receive() error = %v, want missing-path error", err)
+	}
+}
+
+func TestReceiveRejectsWrongSharedSecret(t *testing.T) {
+	root := t.TempDir()
+	serverAddress, stopServer := startServer(t, root)
+	defer stopServer()
+	config := secureClientConfig(t, client.Config{
+		ServerAddress: serverAddress,
+		RequestedPath: "shared",
+		Destination:   filepath.Join(t.TempDir(), "received"),
+		RetryInterval: 20 * time.Millisecond,
+	})
+	config.SharedSecret = bytes.Repeat([]byte{0xff}, 32)
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	if err := client.Receive(ctx, config); err == nil {
+		t.Fatal("Receive() accepted the wrong shared secret")
+	}
+}
+
+func TestServerDoesNotAnswerPlaintextDirectoryRequest(t *testing.T) {
+	root := t.TempDir()
+	serverAddress, stopServer := startServer(t, root)
+	defer stopServer()
+	address, err := net.ResolveUDPAddr("udp", serverAddress)
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection, err := net.DialUDP("udp", nil, address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	id, err := protocol.NewRequestID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	plaintext, err := protocol.EncodeRequest(id, "shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := connection.Write(plaintext); err != nil {
+		t.Fatal(err)
+	}
+	if err := connection.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	buffer := make([]byte, protocol.MaxDatagramSize)
+	if _, err := connection.Read(buffer); err == nil {
+		t.Fatal("server responded to an unencrypted directory request")
+	} else if networkError, ok := err.(net.Error); !ok || !networkError.Timeout() {
+		t.Fatalf("plaintext request read error = %v, want timeout", err)
 	}
 }
 
@@ -118,13 +180,13 @@ func TestReceiveRetriesDroppedRequestAndDataPackets(t *testing.T) {
 	destination := filepath.Join(t.TempDir(), "received")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	err := client.Receive(ctx, client.Config{
+	err := client.Receive(ctx, secureClientConfig(t, client.Config{
 		ServerAddress:  proxyAddress,
 		RequestedPath:  "shared",
 		Destination:    destination,
 		RetryInterval:  30 * time.Millisecond,
 		MaxArchiveSize: 10 << 20,
-	})
+	}))
 	if err != nil {
 		t.Fatalf("Receive() with dropped packets error = %v", err)
 	}
@@ -141,13 +203,13 @@ func TestCompletedTransferImmediatelyReleasesServerSession(t *testing.T) {
 	defer stopServer()
 	for transfer := 0; transfer < 2; transfer++ {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		err := client.Receive(ctx, client.Config{
+		err := client.Receive(ctx, secureClientConfig(t, client.Config{
 			ServerAddress:  serverAddress,
 			RequestedPath:  "shared",
 			Destination:    filepath.Join(t.TempDir(), "received"),
 			RetryInterval:  30 * time.Millisecond,
 			MaxArchiveSize: 1 << 20,
-		})
+		}))
 		cancel()
 		if err != nil {
 			t.Fatalf("Receive() transfer %d error = %v", transfer+1, err)
@@ -172,6 +234,8 @@ func startServerWithMaxSessions(t *testing.T, root string, maxSessions int) (str
 		MaxSourceBytes: 10 << 20,
 		SessionTTL:     time.Minute,
 		MaxSessions:    maxSessions,
+		SharedSecret:   testSharedSecret,
+		ServerIdentity: testRSAIdentity(t),
 		Logger:         log.New(io.Discard, "", 0),
 	})
 	if err != nil {
@@ -207,6 +271,7 @@ func startDroppingProxy(t *testing.T, backendAddress string) (string, func()) {
 	var clientAddress *net.UDPAddr
 	var droppedRequest bool
 	var droppedData bool
+	var plaintextLeaked bool
 	var mu sync.Mutex
 	done := make(chan struct{})
 	go func() {
@@ -222,9 +287,14 @@ func startDroppingProxy(t *testing.T, backendAddress string) (string, func()) {
 			if headerErr != nil {
 				continue
 			}
+			mu.Lock()
+			if bytes.Contains(packet, []byte("shared")) {
+				plaintextLeaked = true
+			}
+			mu.Unlock()
 			if from.String() == backend.String() {
 				mu.Lock()
-				shouldDrop := packetType == protocol.TypeData && !droppedData
+				shouldDrop := packetType == protocol.TypeSecure && !droppedData
 				if shouldDrop {
 					droppedData = true
 				}
@@ -238,7 +308,7 @@ func startDroppingProxy(t *testing.T, backendAddress string) (string, func()) {
 
 			mu.Lock()
 			clientAddress = from
-			shouldDrop := packetType == protocol.TypeRequest && !droppedRequest
+			shouldDrop := packetType == protocol.TypeClientHello && !droppedRequest
 			if shouldDrop {
 				droppedRequest = true
 			}
@@ -260,7 +330,29 @@ func startDroppingProxy(t *testing.T, backendAddress string) (string, func()) {
 		if !droppedRequest || !droppedData {
 			t.Errorf("proxy did not exercise both retries: request=%v data=%v", droppedRequest, droppedData)
 		}
+		if plaintextLeaked {
+			t.Error("UDP traffic exposed the requested directory path in plaintext")
+		}
 	}
+}
+
+func secureClientConfig(t *testing.T, config client.Config) client.Config {
+	t.Helper()
+	identity := testRSAIdentity(t)
+	config.SharedSecret = testSharedSecret
+	config.ServerIdentity = &identity.PublicKey
+	return config
+}
+
+func testRSAIdentity(t *testing.T) *rsa.PrivateKey {
+	t.Helper()
+	testIdentityOnce.Do(func() {
+		testIdentity, testIdentityErr = rsa.GenerateKey(rand.Reader, 2048)
+	})
+	if testIdentityErr != nil {
+		t.Fatalf("generate test RSA identity: %v", testIdentityErr)
+	}
+	return testIdentity
 }
 
 func bytesPattern(size int) []byte {

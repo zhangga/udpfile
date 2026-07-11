@@ -1,6 +1,6 @@
 # udpfile
 
-`udpfile` 是一个用 Go 编写的 UDP 目录传输工具。客户端向服务器提交共享根目录下的相对路径，服务器将该目录内容打包为 `tar.gz`，通过可重试的 UDP 分片传输。它同时提供命令行客户端和只监听本机的 Web 助手；目标文件服务器始终只需要开放 UDP 端口。
+`udpfile` 是一个用 Go 编写的加密 UDP 目录传输工具。客户端向服务器提交共享根目录下的相对路径，服务器将该目录内容打包为 `tar.gz`，通过可重试的 UDP 分片传输。路径、元数据、错误和文件分片都会经过身份认证与逐包加密。它同时提供命令行客户端和只监听本机的 Web 助手；目标文件服务器始终只需要开放 UDP 端口。
 
 ## 快速开始
 
@@ -10,6 +10,7 @@
 go build -o bin/udpfile-server ./cmd/udpfile-server
 go build -o bin/udpfile-client ./cmd/udpfile-client
 go build -o bin/udpfile-web ./cmd/udpfile-web
+go build -o bin/udpfile-keygen ./cmd/udpfile-keygen
 ```
 
 仓库中也包含已交叉编译的静态 Linux x86-64 版本：
@@ -18,6 +19,7 @@ go build -o bin/udpfile-web ./cmd/udpfile-web
 dist/linux-amd64/udpfile-server
 dist/linux-amd64/udpfile-client
 dist/linux-amd64/udpfile-web
+dist/linux-amd64/udpfile-keygen
 ```
 
 在 Linux 上校验后即可运行：
@@ -28,19 +30,52 @@ sha256sum -c SHA256SUMS
 ./udpfile-server -help
 ```
 
+## 生成安全配置
+
+首次部署时，在目标服务器运行一次：
+
+```bash
+./bin/udpfile-keygen
+```
+
+该命令不会覆盖已有文件，并生成：
+
+```text
+.env                         # 端口、目录、共享密钥和密钥路径（权限 0600）
+keys/server-private.pem      # 3072 位 RSA 私钥（权限 0600）
+keys/server-public.pem       # RSA 公钥
+```
+
+编辑 `.env` 中的共享目录和目标 IP：
+
+```dotenv
+UDPFILE_SERVER_ADDR=0.0.0.0:9000
+UDPFILE_ROOT=/srv/share
+UDPFILE_WEB_LISTEN=127.0.0.1:8080
+UDPFILE_TARGET_IP=192.168.1.20
+UDPFILE_TARGET_PORT=9000
+UDPFILE_SHARED_SECRET=<自动生成的 32 字节随机密钥>
+UDPFILE_RSA_PRIVATE_KEY=keys/server-private.pem
+UDPFILE_RSA_PUBLIC_KEY=keys/server-public.pem
+```
+
+服务器保留 `.env` 和 RSA 私钥。客户端需要安全复制同一份共享密钥和 `server-public.pem`，但绝不能复制服务器私钥。三个运行命令都会自动加载当前目录的 `.env`；也可以通过 `UDPFILE_ENV=/path/to/config.env` 指定其他配置文件。
+
+真实 `.env` 和 `keys/` 已被 `.gitignore` 排除；仓库中的 `.env.example` 不包含可用秘密。
+
 ## 从本地网页下载
 
 假设目标服务器 IP 是 `192.168.1.20`，需要共享 `/srv/share`。目标电脑只需启动 UDP 文件服务器：
 
 ```bash
 # 目标服务器：只开放 UDP 9000
-./bin/udpfile-server -addr 0.0.0.0:9000 -root /srv/share
+./bin/udpfile-server
 ```
 
 在本地电脑启动 Web 助手：
 
 ```bash
-./bin/udpfile-web -server 192.168.1.20 -port 9000
+./bin/udpfile-web
 ```
 
 然后用本地浏览器打开：
@@ -65,11 +100,10 @@ tar -xzf 2026.tar.gz
 
 ```bash
 # 目标服务器
-./bin/udpfile-server -addr 0.0.0.0:9000 -root /srv/share
+./bin/udpfile-server
 
 # 本地客户端
 ./bin/udpfile-client \
-  -server 192.168.1.20:9000 \
   -path photos/2026 \
   -out ./received-photos
 ```
@@ -84,16 +118,23 @@ tar -xzf 2026.tar.gz
 
 ## 可靠性与边界
 
-- 每个 UDP 数据报不超过 1232 字节，文件数据块为 1200 字节，避免常见网络上的 IP 分片。
+- 每个 UDP 数据报不超过 1232 字节；加密后的文件数据块为 1120 字节，避免常见网络上的 IP 分片。
 - 客户端逐块请求；请求或响应丢失时，只重试当前元数据/数据块，整个传输受 `-timeout` 控制。
 - 完成后校验整个压缩归档的 SHA-256，损坏的传输不会被解包。
 - 服务端只接受 `-root` 下的相对目录，拒绝 `..` 越界、普通文件、符号链接和设备等特殊文件。
 - 默认单次源目录上限为 10 GiB，可用服务端 `-max-bytes` 调整；客户端另有 `-max-archive` 压缩包大小限制。
 - 服务端收到客户端的完成确认后立即清理临时压缩包；若客户端中途断开，则在 `-session-ttl` 到期后清理。
 
-## 安全提示
+## 加密协议
 
-UDP 文件协议没有加密和身份认证，适合可信本机或受控局域网，不应直接暴露到公网。即使有 SHA-256 校验，它也只能发现意外损坏，不能抵御主动攻击者。建议用目标服务器防火墙把 UDP 端口限制为可信客户端 IP；跨公网传输建议使用 WireGuard、Tailscale 或其他加密隧道。
+- 客户端用 32 字节预共享密钥的 HMAC-SHA256 证明访问权限。
+- 每次会话生成临时 X25519 ECDH 密钥，实现前向保密。
+- 服务端使用 RSA-PSS/SHA-256 签名握手，客户端固定 RSA 公钥以验证服务器身份。
+- ECDH 结果通过 HKDF-SHA256 派生独立的客户端→服务端和服务端→客户端密钥。
+- 每个方向使用经过认证的递增序列号派生 AES-256-GCM nonce；重复或乱序的旧包会被拒绝，被篡改的数据包会被丢弃并由重试机制以新序列号恢复。
+- ARCFour/RC4 不受支持，因为它已不满足现代加密安全要求。
+
+加密不能隐藏通信双方、数据量和时序，也不能阻止 UDP 洪泛等拒绝服务攻击。仍建议用防火墙把 UDP 端口限制为可信客户端 IP；跨公网使用时可再叠加 WireGuard 或 Tailscale。
 
 ## 常用参数
 
