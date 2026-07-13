@@ -24,6 +24,7 @@ const (
 	DefaultRetryInterval     = 300 * time.Millisecond
 	DefaultInactivityTimeout = 10 * time.Minute
 	DefaultMaxArchive        = uint64(11 << 30)
+	transferWindowSize       = uint32(64)
 )
 
 type Config struct {
@@ -170,24 +171,9 @@ func downloadArchive(ctx context.Context, config Config, destination io.Writer) 
 
 	hash := sha256.New()
 	writer := io.MultiWriter(destination, hash)
-	var received uint64
-	for index := uint32(0); index < meta.Chunks; index++ {
-		data, receiveErr := fetchChunk(ctx, connection, secureSession, id, index, config.RetryInterval, activity)
-		if receiveErr != nil {
-			return ArchiveInfo{}, receiveErr
-		}
-		expectedLength := uint64(meta.ChunkSize)
-		if remaining := meta.Size - received; remaining < expectedLength {
-			expectedLength = remaining
-		}
-		if uint64(len(data)) != expectedLength {
-			return ArchiveInfo{}, fmt.Errorf("chunk %d has %d bytes, want %d", index, len(data), expectedLength)
-		}
-		if _, err := writer.Write(data); err != nil {
-			return ArchiveInfo{}, fmt.Errorf("write downloaded chunk: %w", err)
-		}
-		received += uint64(len(data))
-		progressReporter.Report(received, index+1)
+	received, err := receiveChunks(ctx, connection, secureSession, id, meta, config.RetryInterval, activity, writer, progressReporter)
+	if err != nil {
+		return ArchiveInfo{}, err
 	}
 	if received != meta.Size {
 		return ArchiveInfo{}, fmt.Errorf("received %d bytes, want %d", received, meta.Size)
@@ -271,24 +257,135 @@ func awaitMeta(ctx context.Context, connection *net.UDPConn, secureSession *secu
 	return meta, err
 }
 
-func fetchChunk(ctx context.Context, connection *net.UDPConn, secureSession *securetransport.Session, id protocol.RequestID, index uint32, retryInterval time.Duration, activity *inactivityTimer) ([]byte, error) {
+func receiveChunks(
+	ctx context.Context,
+	connection *net.UDPConn,
+	secureSession *securetransport.Session,
+	id protocol.RequestID,
+	meta protocol.Meta,
+	retryInterval time.Duration,
+	activity *inactivityTimer,
+	destination io.Writer,
+	progressReporter *transferprogress.Reporter,
+) (uint64, error) {
+	buffered := make(map[uint32][]byte, transferWindowSize)
+	var nextWrite, nextRequest uint32
+	var received uint64
+
+	fillWindow := func() error {
+		windowEnd := uint64(nextWrite) + uint64(transferWindowSize)
+		for nextRequest < meta.Chunks && uint64(nextRequest) < windowEnd {
+			if err := sendChunkRequest(connection, secureSession, id, nextRequest); err != nil {
+				return err
+			}
+			nextRequest++
+		}
+		return nil
+	}
+	if err := fillWindow(); err != nil {
+		return 0, err
+	}
+
+	for nextWrite < meta.Chunks {
+		if err := transferError(ctx, activity); err != nil {
+			return 0, err
+		}
+		deadline := attemptDeadlineWithInactivity(ctx, retryInterval, activity)
+		encryptedPacket, outerType, readErr := readPacket(connection, id, deadline)
+		if isTimeout(readErr) {
+			for index := nextWrite; index < nextRequest; index++ {
+				if _, alreadyReceived := buffered[index]; alreadyReceived {
+					continue
+				}
+				if err := sendChunkRequest(connection, secureSession, id, index); err != nil {
+					return 0, err
+				}
+			}
+			continue
+		}
+		if readErr != nil {
+			return 0, readErr
+		}
+		if outerType != protocol.TypeSecure {
+			continue
+		}
+		packet, decryptErr := secureSession.Open(encryptedPacket)
+		if decryptErr != nil {
+			continue
+		}
+		packetType, _, headerErr := protocol.Header(packet)
+		if headerErr != nil {
+			continue
+		}
+		if packetType == protocol.TypeError {
+			_, message, decodeErr := protocol.DecodeError(packet)
+			if decodeErr != nil {
+				return 0, decodeErr
+			}
+			return 0, errors.New(message)
+		}
+		if packetType != protocol.TypeData {
+			continue
+		}
+		_, index, data, decodeErr := protocol.DecodeData(packet)
+		if decodeErr != nil {
+			return 0, decodeErr
+		}
+		if index < nextWrite || index >= nextRequest {
+			continue
+		}
+		if _, alreadyReceived := buffered[index]; alreadyReceived {
+			continue
+		}
+		expectedLength := expectedChunkLength(meta, index)
+		if uint64(len(data)) != expectedLength {
+			return 0, fmt.Errorf("chunk %d has %d bytes, want %d", index, len(data), expectedLength)
+		}
+		buffered[index] = data
+		activity.reset()
+
+		for {
+			data, ready := buffered[nextWrite]
+			if !ready {
+				break
+			}
+			if _, err := destination.Write(data); err != nil {
+				return 0, fmt.Errorf("write downloaded chunk: %w", err)
+			}
+			delete(buffered, nextWrite)
+			received += uint64(len(data))
+			nextWrite++
+			progressReporter.Report(received, nextWrite)
+		}
+		if err := fillWindow(); err != nil {
+			return 0, err
+		}
+	}
+	return received, nil
+}
+
+func sendChunkRequest(connection *net.UDPConn, secureSession *securetransport.Session, id protocol.RequestID, index uint32) error {
 	innerRequest, err := protocol.EncodeGet(id, index)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	var result []byte
-	err = exchangeWithRetry(ctx, connection, secureSession, id, innerRequest, retryInterval, activity, func(packet []byte, packetType protocol.Type) (bool, error) {
-		if packetType != protocol.TypeData {
-			return false, nil
-		}
-		_, gotIndex, data, err := protocol.DecodeData(packet)
-		if err != nil || gotIndex != index {
-			return false, nil
-		}
-		result = append([]byte(nil), data...)
-		return true, nil
-	})
-	return result, err
+	request, err := secureSession.Seal(innerRequest)
+	if err != nil {
+		return err
+	}
+	if _, err := connection.Write(request); err != nil {
+		return fmt.Errorf("send UDP chunk request: %w", err)
+	}
+	return nil
+}
+
+func expectedChunkLength(meta protocol.Meta, index uint32) uint64 {
+	offset := uint64(index) * uint64(meta.ChunkSize)
+	remaining := meta.Size - offset
+	if remaining < uint64(meta.ChunkSize) {
+		return remaining
+	}
+	return uint64(meta.ChunkSize)
 }
 
 func exchangeWithRetry(

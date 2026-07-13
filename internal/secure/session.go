@@ -26,6 +26,11 @@ var (
 	hkdfInfoLabel             = []byte("udpfile-v2 AES-256-GCM keys")
 )
 
+const (
+	replayWindowSize  = 256
+	replayWindowWords = replayWindowSize / 64
+)
+
 type ClientHandshake struct {
 	id          protocol.RequestID
 	privateKey  *ecdh.PrivateKey
@@ -42,6 +47,7 @@ type Session struct {
 	outboundSequence uint64
 	inboundMu        sync.Mutex
 	inboundSequence  uint64
+	inboundSeen      [replayWindowWords]uint64
 }
 
 func NewClientHandshake(id protocol.RequestID, sharedSecret []byte) (*ClientHandshake, []byte, error) {
@@ -196,10 +202,9 @@ func (session *Session) Open(encryptedPacket []byte) ([]byte, error) {
 	}
 	session.inboundMu.Lock()
 	defer session.inboundMu.Unlock()
-	if sequence <= session.inboundSequence {
+	if !session.acceptInboundSequence(sequence) {
 		return nil, errors.New("encrypted packet replay detected")
 	}
-	session.inboundSequence = sequence
 	packetType, innerID, err := protocol.Header(plaintext)
 	if err != nil {
 		return nil, errors.New("decrypted packet is malformed")
@@ -208,6 +213,48 @@ func (session *Session) Open(encryptedPacket []byte) ([]byte, error) {
 		return nil, errors.New("decrypted packet does not belong to secure session")
 	}
 	return plaintext, nil
+}
+
+func (session *Session) acceptInboundSequence(sequence uint64) bool {
+	if sequence > session.inboundSequence {
+		shiftReplayWindow(&session.inboundSeen, sequence-session.inboundSequence)
+		session.inboundSequence = sequence
+		session.inboundSeen[0] |= 1
+		return true
+	}
+	distance := session.inboundSequence - sequence
+	if distance >= replayWindowSize {
+		return false
+	}
+	word := distance / 64
+	bit := uint(distance % 64)
+	mask := uint64(1) << bit
+	if session.inboundSeen[word]&mask != 0 {
+		return false
+	}
+	session.inboundSeen[word] |= mask
+	return true
+}
+
+func shiftReplayWindow(window *[replayWindowWords]uint64, distance uint64) {
+	if distance >= replayWindowSize {
+		*window = [replayWindowWords]uint64{}
+		return
+	}
+	wordShift := int(distance / 64)
+	bitShift := uint(distance % 64)
+	var shifted [replayWindowWords]uint64
+	for destination := replayWindowWords - 1; destination >= 0; destination-- {
+		source := destination - wordShift
+		if source < 0 {
+			continue
+		}
+		shifted[destination] |= window[source] << bitShift
+		if bitShift > 0 && source > 0 {
+			shifted[destination] |= window[source-1] >> (64 - bitShift)
+		}
+	}
+	*window = shifted
 }
 
 func sequenceNonce(size int, sequence uint64) []byte {

@@ -25,3 +25,23 @@ func TestCleanupExpiredReleasesAbandonedPreparation(t *testing.T) {
 		t.Fatal("cleanupExpired() retained an abandoned preparing session")
 	}
 }
+
+func TestSentChunkWindowTracksUniqueOutOfOrderChunksWithBoundedMemory(t *testing.T) {
+	current := &session{}
+	for _, index := range []uint32{2, 0, 1} {
+		if !markChunkSent(current, index) {
+			t.Fatalf("markChunkSent(%d) = false, want first send", index)
+		}
+	}
+	if current.sentWindowBase != 3 {
+		t.Fatalf("sent window base = %d, want 3", current.sentWindowBase)
+	}
+	for _, index := range []uint32{0, 1, 2} {
+		if markChunkSent(current, index) {
+			t.Fatalf("markChunkSent(%d) counted a retransmission", index)
+		}
+	}
+	if chunkWithinSendWindow(current, current.sentWindowBase+sendWindowSize) {
+		t.Fatal("send window accepted a new chunk beyond its fixed bound")
+	}
+}

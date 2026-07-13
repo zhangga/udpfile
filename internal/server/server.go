@@ -25,6 +25,8 @@ const (
 	defaultMaxSourceBytes = int64(10 << 30)
 	defaultSessionTTL     = 5 * time.Minute
 	defaultMaxSessions    = 32
+	sendWindowSize        = 256
+	sendWindowWords       = sendWindowSize / 64
 )
 
 type Config struct {
@@ -48,19 +50,21 @@ type Server struct {
 }
 
 type session struct {
-	security      *securetransport.Session
-	clientHello   []byte
-	serverHello   []byte
-	clientAddress string
-	requestedPath string
-	lastAccess    time.Time
-	preparing     bool
-	file          *os.File
-	filePath      string
-	meta          protocol.Meta
-	progress      *transferprogress.Reporter
-	sentBytes     uint64
-	sentChunks    uint32
+	security        *securetransport.Session
+	clientHello     []byte
+	serverHello     []byte
+	clientAddress   string
+	requestedPath   string
+	lastAccess      time.Time
+	preparing       bool
+	file            *os.File
+	filePath        string
+	meta            protocol.Meta
+	progress        *transferprogress.Reporter
+	sentBytes       uint64
+	sentChunks      uint32
+	sentWindowBase  uint32
+	sentChunkWindow [sendWindowWords]uint64
 }
 
 func New(connection *net.UDPConn, config Config) (*Server, error) {
@@ -345,9 +349,7 @@ func (server *Server) handleGet(packet []byte, clientAddress *net.UDPAddr) {
 	}
 	server.mu.Lock()
 	current, ok := server.sessions[id]
-	// New chunks must be requested in order so progress reflects unique data.
-	// Requests for earlier chunks remain valid retransmissions.
-	if !ok || current.preparing || index >= current.meta.Chunks || index > current.sentChunks {
+	if !ok || current.preparing || index >= current.meta.Chunks || !chunkWithinSendWindow(current, index) {
 		server.mu.Unlock()
 		return
 	}
@@ -377,7 +379,7 @@ func (server *Server) handleGet(packet []byte, clientAddress *net.UDPAddr) {
 		sentChunks uint32
 	)
 	server.mu.Lock()
-	if server.sessions[id] == current && index == current.sentChunks {
+	if server.sessions[id] == current && markChunkSent(current, index) {
 		current.sentChunks++
 		current.sentBytes += uint64(len(data))
 		reporter = current.progress
@@ -387,6 +389,40 @@ func (server *Server) handleGet(packet []byte, clientAddress *net.UDPAddr) {
 	server.mu.Unlock()
 	if reporter != nil {
 		reporter.Report(sentBytes, sentChunks)
+	}
+}
+
+func markChunkSent(current *session, index uint32) bool {
+	if index < current.sentWindowBase {
+		return false
+	}
+	distance := index - current.sentWindowBase
+	if distance >= sendWindowSize {
+		return false
+	}
+	word := distance / 64
+	mask := uint64(1) << (distance % 64)
+	if current.sentChunkWindow[word]&mask != 0 {
+		return false
+	}
+	current.sentChunkWindow[word] |= mask
+	for current.sentChunkWindow[0]&1 != 0 {
+		shiftSentChunkWindow(&current.sentChunkWindow)
+		current.sentWindowBase++
+	}
+	return true
+}
+
+func chunkWithinSendWindow(current *session, index uint32) bool {
+	return index < current.sentWindowBase || uint64(index)-uint64(current.sentWindowBase) < uint64(sendWindowSize)
+}
+
+func shiftSentChunkWindow(window *[sendWindowWords]uint64) {
+	for word := 0; word < sendWindowWords; word++ {
+		window[word] >>= 1
+		if word+1 < sendWindowWords {
+			window[word] |= window[word+1] << 63
+		}
 	}
 }
 

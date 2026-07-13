@@ -214,6 +214,44 @@ func TestDownloadArchiveContinuesWhileChunksMakeProgress(t *testing.T) {
 	}
 }
 
+func TestDownloadArchiveMeetsThroughputTargetAcrossLatency(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "shared")
+	mustMkdirAll(t, source)
+	mustWriteFile(t, filepath.Join(source, "payload.bin"), bytesPattern(128<<10))
+	serverAddress, stopServer := startServer(t, root)
+	defer stopServer()
+	proxyAddress, stopProxy := startLatencyProxy(t, serverAddress, 5*time.Millisecond)
+	defer stopProxy()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var downloaded bytes.Buffer
+	started := time.Now()
+	_, err := client.DownloadArchive(ctx, secureClientConfig(t, client.Config{
+		ServerAddress:     proxyAddress,
+		RequestedPath:     "shared",
+		RetryInterval:     100 * time.Millisecond,
+		InactivityTimeout: 2 * time.Second,
+		MaxArchiveSize:    1 << 20,
+	}), &downloaded)
+	elapsed := time.Since(started)
+	if err != nil {
+		t.Fatalf("DownloadArchive() error = %v", err)
+	}
+
+	archivePath := filepath.Join(t.TempDir(), "download.tar.gz")
+	mustWriteFile(t, archivePath, downloaded.Bytes())
+	destination := filepath.Join(t.TempDir(), "received")
+	if err := archivefile.Extract(archivePath, destination); err != nil {
+		t.Fatalf("Extract(download) error = %v", err)
+	}
+	assertFile(t, filepath.Join(destination, "payload.bin"), bytesPattern(128<<10))
+	if elapsed >= 750*time.Millisecond {
+		t.Fatalf("128 KiB transfer took %s across 10ms RTT, want under 750ms", elapsed)
+	}
+}
+
 func TestServerDoesNotAnswerPlaintextDirectoryRequest(t *testing.T) {
 	root := t.TempDir()
 	serverAddress, stopServer := startServer(t, root)
@@ -355,6 +393,7 @@ func startDroppingProxy(t *testing.T, backendAddress string) (string, func()) {
 	var clientAddress *net.UDPAddr
 	var droppedRequest bool
 	var droppedData bool
+	var secureResponses int
 	var plaintextLeaked bool
 	var mu sync.Mutex
 	done := make(chan struct{})
@@ -378,7 +417,10 @@ func startDroppingProxy(t *testing.T, backendAddress string) (string, func()) {
 			mu.Unlock()
 			if from.String() == backend.String() {
 				mu.Lock()
-				shouldDrop := packetType == protocol.TypeSecure && !droppedData
+				if packetType == protocol.TypeSecure {
+					secureResponses++
+				}
+				shouldDrop := packetType == protocol.TypeSecure && secureResponses == 2 && !droppedData
 				if shouldDrop {
 					droppedData = true
 				}
@@ -482,6 +524,61 @@ func startResponseProxy(t *testing.T, backendAddress string, responsePolicy func
 		case <-time.After(time.Second):
 			t.Error("response proxy did not stop")
 		}
+	}
+}
+
+func startLatencyProxy(t *testing.T, backendAddress string, oneWayDelay time.Duration) (string, func()) {
+	t.Helper()
+	backend, err := net.ResolveUDPAddr("udp", backendAddress)
+	if err != nil {
+		t.Fatalf("ResolveUDPAddr() error = %v", err)
+	}
+	connection, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatalf("ListenUDP() latency proxy error = %v", err)
+	}
+	var (
+		clientMu      sync.Mutex
+		clientAddress *net.UDPAddr
+		forwarding    sync.WaitGroup
+	)
+	forward := func(packet []byte, target *net.UDPAddr) {
+		forwarding.Add(1)
+		go func() {
+			defer forwarding.Done()
+			time.Sleep(oneWayDelay)
+			_, _ = connection.WriteToUDP(packet, target)
+		}()
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		buffer := make([]byte, protocol.MaxDatagramSize+1)
+		for {
+			length, from, readErr := connection.ReadFromUDP(buffer)
+			if readErr != nil {
+				return
+			}
+			packet := append([]byte(nil), buffer[:length]...)
+			if from.String() == backend.String() {
+				clientMu.Lock()
+				target := clientAddress
+				clientMu.Unlock()
+				if target != nil {
+					forward(packet, target)
+				}
+				continue
+			}
+			clientMu.Lock()
+			clientAddress = from
+			clientMu.Unlock()
+			forward(packet, backend)
+		}
+	}()
+	return connection.LocalAddr().String(), func() {
+		connection.Close()
+		<-done
+		forwarding.Wait()
 	}
 }
 

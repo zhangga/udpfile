@@ -5,6 +5,9 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"io"
 	"log"
 	"net"
@@ -114,6 +117,48 @@ func TestDownloadExposesCompletedBrowserProgress(t *testing.T) {
 		if !strings.Contains(body, expected) {
 			t.Errorf("GET /progress body does not contain %q: %s", expected, body)
 		}
+	}
+}
+
+func TestBrowserProgressReportsFailureWhenArchiveResponseIsTruncated(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "documents")
+	mustMkdirAll(t, source)
+	mustWriteFile(t, filepath.Join(source, "payload.bin"), bytes.Repeat([]byte("payload"), 4096))
+	udpAddress, stopServer := startUDPServer(t, root)
+	defer stopServer()
+
+	handler, err := webui.NewHandler(webui.Config{
+		DefaultPort:    udpAddress.Port,
+		SharedSecret:   webTestSecret,
+		ServerIdentity: &webRSAIdentity(t).PublicKey,
+		Logger:         log.New(io.Discard, "", 0),
+	})
+	if err != nil {
+		t.Fatalf("NewHandler() error = %v", err)
+	}
+	taskID := strings.Repeat("c", 32)
+	form := url.Values{
+		"csrf_token": {readCSRFToken(t, handler)},
+		"task_id":    {taskID},
+		"server":     {"127.0.0.1"},
+		"port":       {strconv.Itoa(udpAddress.Port)},
+		"path":       {"documents"},
+	}
+	request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/download", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	response := &failingResponseWriter{header: make(http.Header), failAfter: 64}
+	handler.ServeHTTP(response, request)
+	contentLength, parseErr := strconv.Atoi(response.header.Get("Content-Length"))
+	if parseErr != nil || response.written >= contentLength {
+		t.Fatalf("response was not truncated: wrote=%d content-length=%q", response.written, response.header.Get("Content-Length"))
+	}
+
+	progressRequest := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/progress?id="+taskID, nil)
+	progressResponse := httptest.NewRecorder()
+	handler.ServeHTTP(progressResponse, progressRequest)
+	if progressResponse.Code != http.StatusOK || !strings.Contains(progressResponse.Body.String(), `"status":"failed"`) {
+		t.Fatalf("truncated progress status = %d; body=%s", progressResponse.Code, progressResponse.Body.String())
 	}
 }
 
@@ -260,6 +305,63 @@ func TestDownloadBridgesBrowserRequestToUDPArchive(t *testing.T) {
 	assertFile(t, filepath.Join(destination, "nested", "data.bin"), []byte{0, 1, 2, 255})
 }
 
+func TestMultiMegabyteBrowserDownloadHasValidLengthChecksumAndArchive(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "documents")
+	mustMkdirAll(t, source)
+	payload := make([]byte, 4<<20)
+	if _, err := rand.Read(payload); err != nil {
+		t.Fatalf("rand.Read() error = %v", err)
+	}
+	mustWriteFile(t, filepath.Join(source, "payload.bin"), payload)
+	udpAddress, stopServer := startUDPServer(t, root)
+	defer stopServer()
+
+	handler, err := webui.NewHandler(webui.Config{
+		DefaultPort:    udpAddress.Port,
+		SharedSecret:   webTestSecret,
+		ServerIdentity: &webRSAIdentity(t).PublicKey,
+		Logger:         log.New(io.Discard, "", 0),
+	})
+	if err != nil {
+		t.Fatalf("NewHandler() error = %v", err)
+	}
+	form := url.Values{
+		"csrf_token": {readCSRFToken(t, handler)},
+		"server":     {"127.0.0.1"},
+		"port":       {strconv.Itoa(udpAddress.Port)},
+		"path":       {"documents"},
+	}
+	request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/download", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("POST /download status = %d; body=%s", response.Code, response.Body.String())
+	}
+	if response.Header().Get("Content-Length") != strconv.Itoa(response.Body.Len()) {
+		t.Fatalf("Content-Length = %q, body = %d bytes", response.Header().Get("Content-Length"), response.Body.Len())
+	}
+	checksum := sha256.Sum256(response.Body.Bytes())
+	if got := response.Header().Get("X-Archive-SHA256"); got != hex.EncodeToString(checksum[:]) {
+		t.Fatalf("X-Archive-SHA256 = %q, computed %x", got, checksum)
+	}
+
+	archivePath := filepath.Join(t.TempDir(), "download.tar.gz")
+	mustWriteFile(t, archivePath, response.Body.Bytes())
+	destination := filepath.Join(t.TempDir(), "received")
+	if err := archivefile.Extract(archivePath, destination); err != nil {
+		t.Fatalf("Extract(download) error = %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(destination, "payload.bin"))
+	if err != nil {
+		t.Fatalf("ReadFile(payload.bin) error = %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("payload differs: got %d bytes, want %d", len(got), len(payload))
+	}
+}
+
 func TestLocalBridgeRejectsUntrustedHostAndMissingToken(t *testing.T) {
 	handler := newHandler(t)
 
@@ -332,7 +434,7 @@ func startUDPServer(t *testing.T, root string) (*net.UDPAddr, func()) {
 	ctx, cancel := context.WithCancel(context.Background())
 	instance, err := server.New(connection, server.Config{
 		Root:           root,
-		MaxSourceBytes: 1 << 20,
+		MaxSourceBytes: 10 << 20,
 		SessionTTL:     time.Minute,
 		MaxSessions:    4,
 		SharedSecret:   webTestSecret,
@@ -375,6 +477,37 @@ type memoryCredentialStore struct {
 	sharedSecret  []byte
 	identity      *rsa.PublicKey
 	saves         int
+}
+
+type failingResponseWriter struct {
+	header    http.Header
+	status    int
+	written   int
+	failAfter int
+}
+
+func (writer *failingResponseWriter) Header() http.Header {
+	return writer.header
+}
+
+func (writer *failingResponseWriter) WriteHeader(status int) {
+	writer.status = status
+}
+
+func (writer *failingResponseWriter) Write(data []byte) (int, error) {
+	if writer.status == 0 {
+		writer.status = http.StatusOK
+	}
+	remaining := writer.failAfter - writer.written
+	if remaining <= 0 {
+		return 0, errors.New("simulated browser connection failure")
+	}
+	if len(data) > remaining {
+		writer.written += remaining
+		return remaining, errors.New("simulated browser connection failure")
+	}
+	writer.written += len(data)
+	return len(data), nil
 }
 
 func (store *memoryCredentialStore) Load(serverAddress string) ([]byte, *rsa.PublicKey, bool, error) {

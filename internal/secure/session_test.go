@@ -126,3 +126,44 @@ func TestEncryptedPacketRejectsTampering(t *testing.T) {
 		t.Fatalf("tampered packet advanced replay state: %v", err)
 	}
 }
+
+func TestEncryptedSessionAcceptsAuthenticatedPacketsOutOfOrder(t *testing.T) {
+	identity, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret := bytes.Repeat([]byte{0x3c}, 32)
+	id := protocol.RequestID{4, 3, 2, 1}
+	handshake, hello, err := NewClientHandshake(id, secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverHello, serverSession, err := AcceptClientHandshake(hello, secret, identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientSession, err := handshake.Complete(serverHello, &identity.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	packets := make([][]byte, 3)
+	for index := range packets {
+		inner, encodeErr := protocol.EncodeGet(id, uint32(index))
+		if encodeErr != nil {
+			t.Fatal(encodeErr)
+		}
+		packets[index], err = clientSession.Seal(inner)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, index := range []int{2, 0, 1} {
+		if _, err := serverSession.Open(packets[index]); err != nil {
+			t.Fatalf("Open(packet %d) error = %v", index, err)
+		}
+	}
+	if _, err := serverSession.Open(packets[0]); err == nil {
+		t.Fatal("Open() accepted a replayed out-of-order packet")
+	}
+}

@@ -329,19 +329,24 @@ func (handler *Handler) serveDownload(response http.ResponseWriter, request *htt
 		http.Error(response, "无法读取本地临时文件", http.StatusInternalServerError)
 		return
 	}
-	if tracked {
-		handler.finishTransfer(taskID, "completed")
-		transferFinished = true
-	}
-
 	filename := downloadFilename(requestedPath)
 	response.Header().Set("Content-Type", "application/gzip")
 	response.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": filename}))
 	response.Header().Set("Content-Length", strconv.FormatUint(info.Size, 10))
 	response.Header().Set("Cache-Control", "no-store")
 	response.Header().Set("X-Archive-SHA256", hex.EncodeToString(info.SHA256[:]))
-	if _, err := io.Copy(response, temporary); err != nil {
+	written, err := io.Copy(response, temporary)
+	if err != nil {
 		handler.logger.Printf("send browser download %q: %v", filename, err)
+		return
+	}
+	if uint64(written) != info.Size {
+		handler.logger.Printf("send browser download %q: wrote %d bytes, want %d", filename, written, info.Size)
+		return
+	}
+	if tracked {
+		handler.finishTransfer(taskID, "completed")
+		transferFinished = true
 	}
 }
 
