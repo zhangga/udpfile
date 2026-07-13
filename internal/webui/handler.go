@@ -40,17 +40,17 @@ const (
 )
 
 type Config struct {
-	DefaultServer   string
-	DefaultPort     int
-	TempDir         string
-	TransferTimeout time.Duration
-	RetryInterval   time.Duration
-	MaxArchiveSize  uint64
-	MaxConcurrent   int
-	SharedSecret    []byte
-	ServerIdentity  *rsa.PublicKey
-	CredentialStore CredentialStore
-	Logger          *log.Logger
+	DefaultServer     string
+	DefaultPort       int
+	TempDir           string
+	InactivityTimeout time.Duration
+	RetryInterval     time.Duration
+	MaxArchiveSize    uint64
+	MaxConcurrent     int
+	SharedSecret      []byte
+	ServerIdentity    *rsa.PublicKey
+	CredentialStore   CredentialStore
+	Logger            *log.Logger
 }
 
 type CredentialStore interface {
@@ -59,21 +59,21 @@ type CredentialStore interface {
 }
 
 type Handler struct {
-	page            *template.Template
-	csrfToken       string
-	defaultServer   string
-	defaultPort     int
-	tempDir         string
-	timeout         time.Duration
-	retryInterval   time.Duration
-	maxArchive      uint64
-	sharedSecret    []byte
-	serverIdentity  *rsa.PublicKey
-	credentialStore CredentialStore
-	downloadSlots   chan struct{}
-	logger          *log.Logger
-	progressMu      sync.Mutex
-	transfers       map[string]browserProgress
+	page              *template.Template
+	csrfToken         string
+	defaultServer     string
+	defaultPort       int
+	tempDir           string
+	inactivityTimeout time.Duration
+	retryInterval     time.Duration
+	maxArchive        uint64
+	sharedSecret      []byte
+	serverIdentity    *rsa.PublicKey
+	credentialStore   CredentialStore
+	downloadSlots     chan struct{}
+	logger            *log.Logger
+	progressMu        sync.Mutex
+	transfers         map[string]browserProgress
 }
 
 type browserProgress struct {
@@ -120,8 +120,8 @@ func NewHandler(config Config) (http.Handler, error) {
 	if stat, err := os.Stat(config.TempDir); err != nil || !stat.IsDir() {
 		return nil, fmt.Errorf("temporary download directory is unavailable: %s", config.TempDir)
 	}
-	if config.TransferTimeout <= 0 {
-		config.TransferTimeout = 10 * time.Minute
+	if config.InactivityTimeout <= 0 {
+		config.InactivityTimeout = client.DefaultInactivityTimeout
 	}
 	if config.RetryInterval <= 0 {
 		config.RetryInterval = DefaultRetryInterval
@@ -141,20 +141,20 @@ func NewHandler(config Config) (http.Handler, error) {
 		return nil, err
 	}
 	return &Handler{
-		page:            page,
-		csrfToken:       csrfToken,
-		defaultServer:   config.DefaultServer,
-		defaultPort:     config.DefaultPort,
-		tempDir:         config.TempDir,
-		timeout:         config.TransferTimeout,
-		retryInterval:   config.RetryInterval,
-		maxArchive:      config.MaxArchiveSize,
-		sharedSecret:    append([]byte(nil), config.SharedSecret...),
-		serverIdentity:  config.ServerIdentity,
-		credentialStore: config.CredentialStore,
-		downloadSlots:   make(chan struct{}, config.MaxConcurrent),
-		logger:          config.Logger,
-		transfers:       make(map[string]browserProgress),
+		page:              page,
+		csrfToken:         csrfToken,
+		defaultServer:     config.DefaultServer,
+		defaultPort:       config.DefaultPort,
+		tempDir:           config.TempDir,
+		inactivityTimeout: config.InactivityTimeout,
+		retryInterval:     config.RetryInterval,
+		maxArchive:        config.MaxArchiveSize,
+		sharedSecret:      append([]byte(nil), config.SharedSecret...),
+		serverIdentity:    config.ServerIdentity,
+		credentialStore:   config.CredentialStore,
+		downloadSlots:     make(chan struct{}, config.MaxConcurrent),
+		logger:            config.Logger,
+		transfers:         make(map[string]browserProgress),
 	}, nil
 }
 
@@ -292,16 +292,17 @@ func (handler *Handler) serveDownload(response http.ResponseWriter, request *htt
 			}
 		}
 	}
-	ctx, cancel := context.WithTimeout(request.Context(), handler.timeout)
+	ctx, cancel := context.WithCancel(request.Context())
 	info, downloadErr := client.DownloadArchive(ctx, client.Config{
-		ServerAddress:  serverAddress,
-		RequestedPath:  requestedPath,
-		RetryInterval:  handler.retryInterval,
-		MaxArchiveSize: handler.maxArchive,
-		SharedSecret:   sharedSecret,
-		ServerIdentity: serverIdentity,
-		Logger:         handler.logger,
-		Progress:       handler.progressObserver(taskID),
+		ServerAddress:     serverAddress,
+		RequestedPath:     requestedPath,
+		RetryInterval:     handler.retryInterval,
+		InactivityTimeout: handler.inactivityTimeout,
+		MaxArchiveSize:    handler.maxArchive,
+		SharedSecret:      sharedSecret,
+		ServerIdentity:    serverIdentity,
+		Logger:            handler.logger,
+		Progress:          handler.progressObserver(taskID),
 	}, temporary)
 	cancel()
 	if downloadErr != nil {

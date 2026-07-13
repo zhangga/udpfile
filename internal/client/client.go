@@ -21,20 +21,22 @@ import (
 )
 
 const (
-	DefaultRetryInterval = 300 * time.Millisecond
-	DefaultMaxArchive    = uint64(11 << 30)
+	DefaultRetryInterval     = 300 * time.Millisecond
+	DefaultInactivityTimeout = 10 * time.Minute
+	DefaultMaxArchive        = uint64(11 << 30)
 )
 
 type Config struct {
-	ServerAddress  string
-	RequestedPath  string
-	Destination    string
-	RetryInterval  time.Duration
-	MaxArchiveSize uint64
-	SharedSecret   []byte
-	ServerIdentity *rsa.PublicKey
-	Logger         *log.Logger
-	Progress       func(transferprogress.Snapshot)
+	ServerAddress     string
+	RequestedPath     string
+	Destination       string
+	RetryInterval     time.Duration
+	InactivityTimeout time.Duration
+	MaxArchiveSize    uint64
+	SharedSecret      []byte
+	ServerIdentity    *rsa.PublicKey
+	Logger            *log.Logger
+	Progress          func(transferprogress.Snapshot)
 }
 
 type ArchiveInfo struct {
@@ -115,6 +117,9 @@ func normalizeConfig(config Config) (Config, error) {
 	if config.RetryInterval <= 0 {
 		config.RetryInterval = DefaultRetryInterval
 	}
+	if config.InactivityTimeout <= 0 {
+		config.InactivityTimeout = DefaultInactivityTimeout
+	}
 	if config.MaxArchiveSize == 0 {
 		config.MaxArchiveSize = DefaultMaxArchive
 	}
@@ -140,7 +145,8 @@ func downloadArchive(ctx context.Context, config Config, destination io.Writer) 
 	if err != nil {
 		return ArchiveInfo{}, err
 	}
-	secureSession, err := awaitServerHandshake(ctx, connection, id, clientHello, handshake, config.ServerIdentity, config.RetryInterval)
+	activity := newInactivityTimer(config.InactivityTimeout)
+	secureSession, err := awaitServerHandshake(ctx, connection, id, clientHello, handshake, config.ServerIdentity, config.RetryInterval, activity)
 	if err != nil {
 		return ArchiveInfo{}, err
 	}
@@ -148,7 +154,7 @@ func downloadArchive(ctx context.Context, config Config, destination io.Writer) 
 	if err != nil {
 		return ArchiveInfo{}, err
 	}
-	meta, err := awaitMeta(ctx, connection, secureSession, id, innerRequest, config.RetryInterval)
+	meta, err := awaitMeta(ctx, connection, secureSession, id, innerRequest, config.RetryInterval, activity)
 	if err != nil {
 		return ArchiveInfo{}, err
 	}
@@ -166,7 +172,7 @@ func downloadArchive(ctx context.Context, config Config, destination io.Writer) 
 	writer := io.MultiWriter(destination, hash)
 	var received uint64
 	for index := uint32(0); index < meta.Chunks; index++ {
-		data, receiveErr := fetchChunk(ctx, connection, secureSession, id, index, config.RetryInterval)
+		data, receiveErr := fetchChunk(ctx, connection, secureSession, id, index, config.RetryInterval, activity)
 		if receiveErr != nil {
 			return ArchiveInfo{}, receiveErr
 		}
@@ -190,7 +196,7 @@ func downloadArchive(ctx context.Context, config Config, destination io.Writer) 
 		return ArchiveInfo{}, errors.New("downloaded archive checksum does not match server metadata")
 	}
 	completionCtx, cancelCompletion := context.WithTimeout(ctx, 3*config.RetryInterval)
-	completionErr := finishSession(completionCtx, connection, secureSession, id, config.RetryInterval)
+	completionErr := finishSession(completionCtx, connection, secureSession, id, config.RetryInterval, activity)
 	cancelCompletion()
 	if completionErr != nil && config.Logger != nil {
 		config.Logger.Printf("warning: server will clean this session after its TTL: %v", completionErr)
@@ -206,15 +212,16 @@ func awaitServerHandshake(
 	handshake *securetransport.ClientHandshake,
 	identity *rsa.PublicKey,
 	retryInterval time.Duration,
+	activity *inactivityTimer,
 ) (*securetransport.Session, error) {
 	for {
-		if err := contextError(ctx); err != nil {
+		if err := transferError(ctx, activity); err != nil {
 			return nil, err
 		}
 		if _, err := connection.Write(clientHello); err != nil {
 			return nil, fmt.Errorf("send secure handshake: %w", err)
 		}
-		deadline := attemptDeadline(ctx, retryInterval)
+		deadline := attemptDeadlineWithInactivity(ctx, retryInterval, activity)
 		for {
 			packet, packetType, readErr := readPacket(connection, id, deadline)
 			if isTimeout(readErr) {
@@ -226,17 +233,21 @@ func awaitServerHandshake(
 			if packetType != protocol.TypeServerHello {
 				continue
 			}
-			return handshake.Complete(packet, identity)
+			session, completeErr := handshake.Complete(packet, identity)
+			if completeErr == nil {
+				activity.reset()
+			}
+			return session, completeErr
 		}
 	}
 }
 
-func finishSession(ctx context.Context, connection *net.UDPConn, secureSession *securetransport.Session, id protocol.RequestID, retryInterval time.Duration) error {
+func finishSession(ctx context.Context, connection *net.UDPConn, secureSession *securetransport.Session, id protocol.RequestID, retryInterval time.Duration, activity *inactivityTimer) error {
 	innerRequest, err := protocol.EncodeDone(id)
 	if err != nil {
 		return err
 	}
-	return exchangeWithRetry(ctx, connection, secureSession, id, innerRequest, retryInterval, func(packet []byte, packetType protocol.Type) (bool, error) {
+	return exchangeWithRetry(ctx, connection, secureSession, id, innerRequest, retryInterval, activity, func(packet []byte, packetType protocol.Type) (bool, error) {
 		if packetType != protocol.TypeDone {
 			return false, nil
 		}
@@ -245,9 +256,9 @@ func finishSession(ctx context.Context, connection *net.UDPConn, secureSession *
 	})
 }
 
-func awaitMeta(ctx context.Context, connection *net.UDPConn, secureSession *securetransport.Session, id protocol.RequestID, innerRequest []byte, retryInterval time.Duration) (protocol.Meta, error) {
+func awaitMeta(ctx context.Context, connection *net.UDPConn, secureSession *securetransport.Session, id protocol.RequestID, innerRequest []byte, retryInterval time.Duration, activity *inactivityTimer) (protocol.Meta, error) {
 	var meta protocol.Meta
-	err := exchangeWithRetry(ctx, connection, secureSession, id, innerRequest, retryInterval, func(packet []byte, packetType protocol.Type) (bool, error) {
+	err := exchangeWithRetry(ctx, connection, secureSession, id, innerRequest, retryInterval, activity, func(packet []byte, packetType protocol.Type) (bool, error) {
 		if packetType != protocol.TypeMeta {
 			return false, nil
 		}
@@ -260,13 +271,13 @@ func awaitMeta(ctx context.Context, connection *net.UDPConn, secureSession *secu
 	return meta, err
 }
 
-func fetchChunk(ctx context.Context, connection *net.UDPConn, secureSession *securetransport.Session, id protocol.RequestID, index uint32, retryInterval time.Duration) ([]byte, error) {
+func fetchChunk(ctx context.Context, connection *net.UDPConn, secureSession *securetransport.Session, id protocol.RequestID, index uint32, retryInterval time.Duration, activity *inactivityTimer) ([]byte, error) {
 	innerRequest, err := protocol.EncodeGet(id, index)
 	if err != nil {
 		return nil, err
 	}
 	var result []byte
-	err = exchangeWithRetry(ctx, connection, secureSession, id, innerRequest, retryInterval, func(packet []byte, packetType protocol.Type) (bool, error) {
+	err = exchangeWithRetry(ctx, connection, secureSession, id, innerRequest, retryInterval, activity, func(packet []byte, packetType protocol.Type) (bool, error) {
 		if packetType != protocol.TypeData {
 			return false, nil
 		}
@@ -287,10 +298,11 @@ func exchangeWithRetry(
 	id protocol.RequestID,
 	innerRequest []byte,
 	retryInterval time.Duration,
+	activity *inactivityTimer,
 	handle func([]byte, protocol.Type) (bool, error),
 ) error {
 	for {
-		if err := contextError(ctx); err != nil {
+		if err := transferError(ctx, activity); err != nil {
 			return err
 		}
 		request, err := secureSession.Seal(innerRequest)
@@ -300,7 +312,7 @@ func exchangeWithRetry(
 		if _, err := connection.Write(request); err != nil {
 			return fmt.Errorf("send UDP request: %w", err)
 		}
-		deadline := attemptDeadline(ctx, retryInterval)
+		deadline := attemptDeadlineWithInactivity(ctx, retryInterval, activity)
 		for {
 			encryptedPacket, outerType, readErr := readPacket(connection, id, deadline)
 			if isTimeout(readErr) {
@@ -328,8 +340,12 @@ func exchangeWithRetry(
 				return errors.New(message)
 			}
 			done, handleErr := handle(packet, packetType)
-			if handleErr != nil || done {
+			if handleErr != nil {
 				return handleErr
+			}
+			if done {
+				activity.reset()
+				return nil
 			}
 		}
 	}
@@ -360,6 +376,44 @@ func attemptDeadline(ctx context.Context, retryInterval time.Duration) time.Time
 		return contextDeadline
 	}
 	return deadline
+}
+
+type inactivityTimer struct {
+	timeout  time.Duration
+	deadline time.Time
+}
+
+func newInactivityTimer(timeout time.Duration) *inactivityTimer {
+	return &inactivityTimer{timeout: timeout, deadline: time.Now().Add(timeout)}
+}
+
+func (timer *inactivityTimer) reset() {
+	timer.deadline = time.Now().Add(timer.timeout)
+}
+
+func (timer *inactivityTimer) err() error {
+	if !time.Now().Before(timer.deadline) {
+		return context.DeadlineExceeded
+	}
+	return nil
+}
+
+func attemptDeadlineWithInactivity(ctx context.Context, retryInterval time.Duration, activity *inactivityTimer) time.Time {
+	deadline := attemptDeadline(ctx, retryInterval)
+	if activity.deadline.Before(deadline) {
+		return activity.deadline
+	}
+	return deadline
+}
+
+func transferError(ctx context.Context, activity *inactivityTimer) error {
+	if err := contextError(ctx); err != nil {
+		return err
+	}
+	if err := activity.err(); err != nil {
+		return fmt.Errorf("transfer stopped after %s without progress: %w", activity.timeout, err)
+	}
+	return nil
 }
 
 func contextError(ctx context.Context) error {

@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"errors"
 	"io"
 	"log"
 	"net"
@@ -127,6 +128,89 @@ func TestReceiveRejectsWrongSharedSecret(t *testing.T) {
 	defer cancel()
 	if err := client.Receive(ctx, config); err == nil {
 		t.Fatal("Receive() accepted the wrong shared secret")
+	}
+}
+
+func TestDownloadArchiveStopsAfterInactivity(t *testing.T) {
+	root := t.TempDir()
+	serverAddress, stopServer := startServer(t, root)
+	defer stopServer()
+	config := secureClientConfig(t, client.Config{
+		ServerAddress:     serverAddress,
+		RequestedPath:     "shared",
+		RetryInterval:     10 * time.Millisecond,
+		InactivityTimeout: 80 * time.Millisecond,
+	})
+	config.SharedSecret = bytes.Repeat([]byte{0xff}, 32)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	started := time.Now()
+	_, err := client.DownloadArchive(ctx, config, io.Discard)
+	elapsed := time.Since(started)
+
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("DownloadArchive() error = %v, want inactivity deadline", err)
+	}
+	if elapsed >= 500*time.Millisecond {
+		t.Fatalf("DownloadArchive() stopped after %s, want inactivity timeout before parent deadline", elapsed)
+	}
+}
+
+func TestDownloadArchiveStopsWhenProgressCeasesAfterHandshake(t *testing.T) {
+	root := t.TempDir()
+	mustMkdirAll(t, filepath.Join(root, "shared"))
+	serverAddress, stopServer := startServer(t, root)
+	defer stopServer()
+	proxyAddress, stopProxy := startStallingAfterHandshakeProxy(t, serverAddress)
+	defer stopProxy()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	started := time.Now()
+	_, err := client.DownloadArchive(ctx, secureClientConfig(t, client.Config{
+		ServerAddress:     proxyAddress,
+		RequestedPath:     "shared",
+		RetryInterval:     10 * time.Millisecond,
+		InactivityTimeout: 80 * time.Millisecond,
+	}), io.Discard)
+	elapsed := time.Since(started)
+
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("DownloadArchive() error = %v, want inactivity deadline", err)
+	}
+	if elapsed >= 500*time.Millisecond {
+		t.Fatalf("DownloadArchive() stopped after %s, want inactivity timeout after handshake", elapsed)
+	}
+}
+
+func TestDownloadArchiveContinuesWhileChunksMakeProgress(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "shared")
+	mustMkdirAll(t, source)
+	mustWriteFile(t, filepath.Join(source, "slow.bin"), bytesPattern(6_000))
+	serverAddress, stopServer := startServer(t, root)
+	defer stopServer()
+	proxyAddress, stopProxy := startDelayingResponsesProxy(t, serverAddress, 20*time.Millisecond)
+	defer stopProxy()
+
+	const inactivityTimeout = 70 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	started := time.Now()
+	_, err := client.DownloadArchive(ctx, secureClientConfig(t, client.Config{
+		ServerAddress:     proxyAddress,
+		RequestedPath:     "shared",
+		RetryInterval:     50 * time.Millisecond,
+		InactivityTimeout: inactivityTimeout,
+		MaxArchiveSize:    1 << 20,
+	}), io.Discard)
+	elapsed := time.Since(started)
+
+	if err != nil {
+		t.Fatalf("DownloadArchive() error = %v", err)
+	}
+	if elapsed <= inactivityTimeout {
+		t.Fatalf("DownloadArchive() completed in %s; test did not exceed inactivity timeout %s", elapsed, inactivityTimeout)
 	}
 }
 
@@ -332,6 +416,71 @@ func startDroppingProxy(t *testing.T, backendAddress string) (string, func()) {
 		}
 		if plaintextLeaked {
 			t.Error("UDP traffic exposed the requested directory path in plaintext")
+		}
+	}
+}
+
+func startStallingAfterHandshakeProxy(t *testing.T, backendAddress string) (string, func()) {
+	return startResponseProxy(t, backendAddress, func(packetType protocol.Type) (bool, time.Duration) {
+		return packetType != protocol.TypeSecure, 0
+	})
+}
+
+func startDelayingResponsesProxy(t *testing.T, backendAddress string, delay time.Duration) (string, func()) {
+	return startResponseProxy(t, backendAddress, func(protocol.Type) (bool, time.Duration) {
+		return true, delay
+	})
+}
+
+func startResponseProxy(t *testing.T, backendAddress string, responsePolicy func(protocol.Type) (bool, time.Duration)) (string, func()) {
+	t.Helper()
+	backend, err := net.ResolveUDPAddr("udp", backendAddress)
+	if err != nil {
+		t.Fatalf("ResolveUDPAddr() error = %v", err)
+	}
+	connection, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatalf("ListenUDP() proxy error = %v", err)
+	}
+	var clientAddress *net.UDPAddr
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		buffer := make([]byte, protocol.MaxDatagramSize+1)
+		for {
+			length, from, readErr := connection.ReadFromUDP(buffer)
+			if readErr != nil {
+				return
+			}
+			packet := append([]byte(nil), buffer[:length]...)
+			if from.String() == backend.String() {
+				packetType, _, headerErr := protocol.Header(packet)
+				if headerErr != nil {
+					continue
+				}
+				forward, delay := responsePolicy(packetType)
+				if !forward {
+					continue
+				}
+				target := clientAddress
+				if target != nil {
+					if delay > 0 {
+						time.Sleep(delay)
+					}
+					_, _ = connection.WriteToUDP(packet, target)
+				}
+				continue
+			}
+			clientAddress = from
+			_, _ = connection.WriteToUDP(packet, backend)
+		}
+	}()
+	return connection.LocalAddr().String(), func() {
+		connection.Close()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Error("response proxy did not stop")
 		}
 	}
 }

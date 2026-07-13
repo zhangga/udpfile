@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"udpfile/internal/appconfig"
+	"udpfile/internal/client"
 	"udpfile/internal/webui"
 )
 
@@ -30,7 +31,7 @@ func runWeb(commandName string, arguments []string, output, diagnostics io.Write
 	listenAddress := flags.String("listen", appconfig.String("UDPFILE_WEB_LISTEN", "127.0.0.1:8080"), "本地 Web 监听地址（仅允许回环地址）")
 	defaultServer := flags.String("server", appconfig.String("UDPFILE_TARGET_IP", ""), "页面中预填的目标 UDP 服务器 IP")
 	defaultPort := flags.Int("port", environmentPort, "页面中预填的目标 UDP 端口")
-	transferTimeout := flags.Duration("timeout", 10*time.Minute, "单次 UDP 下载的超时时间")
+	inactivityTimeout := flags.Duration("timeout", client.DefaultInactivityTimeout, "无有效数据进展的超时时间")
 	retryInterval := flags.Duration("retry", webui.DefaultRetryInterval, "UDP 数据包重试间隔")
 	maxArchive := flags.Uint64("max-archive", webui.DefaultMaxArchive, "允许下载的最大压缩包字节数")
 	maxDownloads := flags.Int("max-downloads", 2, "最大并发浏览器下载数")
@@ -44,14 +45,14 @@ func runWeb(commandName string, arguments []string, output, diagnostics io.Write
 	}
 	logger := log.New(output, "udpfile client: ", log.LstdFlags)
 	handlerConfig := webui.Config{
-		DefaultServer:   *defaultServer,
-		DefaultPort:     *defaultPort,
-		TempDir:         *tempDir,
-		TransferTimeout: *transferTimeout,
-		RetryInterval:   *retryInterval,
-		MaxArchiveSize:  *maxArchive,
-		MaxConcurrent:   *maxDownloads,
-		Logger:          logger,
+		DefaultServer:     *defaultServer,
+		DefaultPort:       *defaultPort,
+		TempDir:           *tempDir,
+		InactivityTimeout: *inactivityTimeout,
+		RetryInterval:     *retryInterval,
+		MaxArchiveSize:    *maxArchive,
+		MaxConcurrent:     *maxDownloads,
+		Logger:            logger,
 	}
 	if os.Getenv("UDPFILE_SHARED_SECRET") != "" || os.Getenv("UDPFILE_RSA_PUBLIC_KEY") != "" {
 		sharedSecret, serverIdentity, credentialErr := appconfig.LoadClientCredentials()

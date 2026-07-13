@@ -15,7 +15,6 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"time"
 
 	"udpfile/internal/appconfig"
 	"udpfile/internal/client"
@@ -35,7 +34,7 @@ func runDownload(arguments []string, output, diagnostics io.Writer) error {
 	serverAddress := flags.String("server", defaultServerAddress, "UDP 服务器地址")
 	requestedPath := flags.String("path", "", "服务器共享根目录下的相对文件夹路径")
 	destination := flags.String("out", "", "本地输出目录（必须尚不存在）")
-	timeout := flags.Duration("timeout", 10*time.Minute, "整个传输的超时时间")
+	inactivityTimeout := flags.Duration("timeout", client.DefaultInactivityTimeout, "无有效数据进展的超时时间")
 	retry := flags.Duration("retry", client.DefaultRetryInterval, "未收到数据包时的重试间隔")
 	maxArchive := flags.Uint64("max-archive", client.DefaultMaxArchive, "客户端接受的最大压缩归档字节数")
 	pairingFile := flags.String("pair-file", "", "从权限为 0600 的文件读取首次配对令牌；- 表示标准输入")
@@ -57,18 +56,19 @@ func runDownload(arguments []string, output, diagnostics io.Writer) error {
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	logger := log.New(output, "udpfile download: ", log.LstdFlags)
 	if err := client.Receive(ctx, client.Config{
-		ServerAddress:  *serverAddress,
-		RequestedPath:  *requestedPath,
-		Destination:    *destination,
-		RetryInterval:  *retry,
-		MaxArchiveSize: *maxArchive,
-		SharedSecret:   sharedSecret,
-		ServerIdentity: serverIdentity,
-		Logger:         logger,
+		ServerAddress:     *serverAddress,
+		RequestedPath:     *requestedPath,
+		Destination:       *destination,
+		RetryInterval:     *retry,
+		InactivityTimeout: *inactivityTimeout,
+		MaxArchiveSize:    *maxArchive,
+		SharedSecret:      sharedSecret,
+		ServerIdentity:    serverIdentity,
+		Logger:            logger,
 	}); err != nil {
 		return err
 	}
